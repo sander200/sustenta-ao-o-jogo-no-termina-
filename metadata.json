@@ -1,6 +1,0 @@
-{
-  "name": "Sustentação: O Dia Nunca Termina",
-  "description": "Jogo 2.5D de simulação corporativa, RPG e estratégia de priorização no cotidiano de uma equipe de Sustentação SAP.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
