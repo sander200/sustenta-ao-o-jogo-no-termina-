@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React from 'react';
 import { PlayerStats, Ticket } from '../types.ts';
 import { InteractiveTarget } from '../three/OfficeScene.ts';
 import {
@@ -31,8 +31,6 @@ interface GameHUDProps {
   onOpenAchievements: () => void;
   onOpenHelp: () => void;
   onInteract: () => void;
-  onMove: (x: number, y: number) => void;
-  onSprint: (active: boolean) => void;
 }
 
 export const GameHUD: React.FC<GameHUDProps> = ({
@@ -51,8 +49,6 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   onOpenAchievements,
   onOpenHelp,
   onInteract,
-  onMove,
-  onSprint,
 }) => {
   // Format time (e.g. 480 mins -> 08:00)
   const formatTime = (minutes: number) => {
@@ -162,35 +158,6 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         )}
       </div>
 
-      <div className="pointer-events-none absolute inset-x-0 bottom-28 z-20 flex items-end justify-between px-2 sm:px-4">
-        <MoveStick onChange={onMove} />
-        <div className="pointer-events-auto flex items-end gap-2">
-          <div className="mb-6 flex flex-col gap-2">
-            <RoundButton label="Ajuda" color="#2563eb" onClick={onOpenHelp} />
-            <RoundButton label="Kanban" color="#0ea5e9" onClick={onOpenKanban} />
-          </div>
-          <RoundButton label="E-mail" color="#0284c7" onClick={onOpenEmails} />
-          <RoundButton label="Fila" color="#7c3aed" onClick={onOpenTerminal} />
-          <button
-            onPointerDown={() => onSprint(true)}
-            onPointerUp={() => onSprint(false)}
-            onPointerLeave={() => onSprint(false)}
-            className="mb-8 h-16 rounded-full bg-[#2563eb] px-3 text-[10px] font-black uppercase tracking-wide text-white shadow-lg shadow-blue-900/50"
-          >
-            Correr
-          </button>
-          <button
-            onClick={() => {
-              sound.playClick();
-              onInteract();
-            }}
-            className="flex h-24 w-24 items-center justify-center rounded-full border-4 border-red-300/70 bg-[#ef233c] text-center text-sm font-black uppercase leading-tight text-white shadow-xl shadow-red-900/40 active:scale-95"
-          >
-            Interagir
-          </button>
-        </div>
-      </div>
-
       {/* Bottom Collapsible Dock: Clean 0-occlusion controls */}
       <footer className="pointer-events-auto mx-auto max-w-2xl w-full flex items-center justify-between gap-2 bg-slate-900/90 border border-slate-700/80 rounded-2xl px-4 py-2.5 shadow-2xl backdrop-blur-md">
         <div className="flex items-center gap-2">
@@ -292,65 +259,6 @@ function StatChip({
           <div className={`h-full ${bar}`} style={{ width: `${Math.max(0, Math.min(100, width))}%` }} />
         </div>
       </div>
-    </div>
-  );
-}
-
-function RoundButton({ label, color, onClick }: { label: string; color: string; onClick: () => void }) {
-  return (
-    <button
-      onClick={() => {
-        sound.playClick();
-        onClick();
-      }}
-      style={{ background: color }}
-      className="flex h-14 w-14 items-center justify-center rounded-full border-2 border-white/30 text-[9px] font-black uppercase leading-tight text-white shadow-lg active:scale-95"
-    >
-      {label}
-    </button>
-  );
-}
-
-function MoveStick({ onChange }: { onChange: (x: number, y: number) => void }) {
-  const zone = useRef<HTMLDivElement>(null);
-  const [knob, setKnob] = useState({ x: 0, y: 0 });
-
-  const setFromPoint = (clientX: number, clientY: number) => {
-    const rect = zone.current?.getBoundingClientRect();
-    if (!rect) return;
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    let dx = clientX - cx;
-    let dy = clientY - cy;
-    const max = rect.width * 0.36;
-    const len = Math.hypot(dx, dy) || 1;
-    const clamped = Math.min(len, max);
-    dx = (dx / len) * clamped;
-    dy = (dy / len) * clamped;
-    setKnob({ x: dx, y: dy });
-    onChange(dx / max, -dy / max);
-  };
-
-  const release = () => {
-    setKnob({ x: 0, y: 0 });
-    onChange(0, 0);
-  };
-
-  return (
-    <div
-      ref={zone}
-      className="pointer-events-auto relative h-28 w-28 rounded-full border-2 border-cyan-300/50 bg-slate-900/45 shadow-inner"
-      onPointerDown={(event) => {
-        event.currentTarget.setPointerCapture(event.pointerId);
-        setFromPoint(event.clientX, event.clientY);
-      }}
-      onPointerMove={(event) => {
-        if (event.currentTarget.hasPointerCapture(event.pointerId)) setFromPoint(event.clientX, event.clientY);
-      }}
-      onPointerUp={release}
-      onPointerCancel={release}
-    >
-      <div className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full bg-cyan-400/90 shadow-lg shadow-cyan-500/40" style={{ transform: `translate(calc(-50% + ${knob.x}px), calc(-50% + ${knob.y}px))` }} />
     </div>
   );
 }

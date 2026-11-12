@@ -531,15 +531,6 @@ export default function App() {
           onOpenAchievements={() => setShowAchievements(true)}
           onOpenHelp={() => setShowHelp(true)}
           onInteract={handleExecuteInteraction}
-          onMove={(x, y) => {
-            const world = officeSceneRef.current;
-            if (!world) return;
-            world.stickX = x;
-            world.stickY = y;
-          }}
-          onSprint={(active) => {
-            if (officeSceneRef.current) officeSceneRef.current.sprint = active;
-          }}
         />
       )}
 

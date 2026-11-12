@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { evaluateMission } from './evaluate.server.ts';
+import { evaluateMission } from './evaluate.ts';
 import type { EvaluationResult, EvidenceSubmission } from './evaluate-rules.ts';
 
 const empty: EvidenceSubmission = {
