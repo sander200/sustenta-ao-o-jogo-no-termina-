@@ -6,19 +6,31 @@ import {
   createServerRackTexture,
   createWoodParquetTexture,
 } from '../three/textures.ts';
+import {
+  createStylizedAvatar,
+  type StylizedAvatarHandle,
+} from '../three/StylizedAvatar.ts';
 
 type Solid = { minX: number; maxX: number; minZ: number; maxZ: number };
 
-const FACES: Record<string, string> = {
-  npc_bruna_folha: '/sustenta/faces/bruna.png',
-  npc_carlos_beneficios: '/sustenta/faces/carlos.png',
-  npc_juliana_cadastro: '/sustenta/faces/bruna.png',
-  npc_roberto_contabil: '/sustenta/faces/roberto.png',
-  npc_mariana_funcional: '/sustenta/faces/bruna.png',
-  npc_lucas_abap: '/sustenta/faces/lucas.png',
-  npc_fabio_basis: '/sustenta/faces/fabio.png',
-  npc_gestor_marcos: '/sustenta/faces/marcos.png',
-  npc_tania_cafe: '/sustenta/faces/bruna.png',
+const NPC_STYLES: Record<
+  string,
+  {
+    hairStyle?: 'short' | 'long' | 'curly' | 'bun' | 'parted';
+    hasGlasses?: boolean;
+    hairColor?: string | number;
+    shirtColor?: string | number;
+  }
+> = {
+  npc_bruna_folha: { hairStyle: 'long', hairColor: '#451a03', shirtColor: '#8b5cf6' },
+  npc_carlos_beneficios: { hairStyle: 'short', hairColor: '#172554', shirtColor: '#06b6d4' },
+  npc_juliana_cadastro: { hairStyle: 'bun', hairColor: '#78350f', shirtColor: '#10b981' },
+  npc_roberto_contabil: { hairStyle: 'parted', hairColor: '#334155', shirtColor: '#f59e0b', hasGlasses: true },
+  npc_mariana_funcional: { hairStyle: 'long', hairColor: '#831843', shirtColor: '#ec4899' },
+  npc_lucas_abap: { hairStyle: 'short', hairColor: '#0f172a', shirtColor: '#3b82f6' },
+  npc_fabio_basis: { hairStyle: 'short', hairColor: '#1e1b4b', shirtColor: '#6366f1' },
+  npc_gestor_marcos: { hairStyle: 'parted', hairColor: '#64748b', shirtColor: '#dc2626', hasGlasses: true },
+  npc_tania_cafe: { hairStyle: 'curly', hairColor: '#92400e', shirtColor: '#f43f5e' },
 };
 
 const NPC_SPOTS: Record<string, { x: number; z: number }> = {
@@ -44,11 +56,13 @@ export class ExpedienteWorld {
   private scene = new THREE.Scene();
   private camera = new THREE.PerspectiveCamera(55, 1, 0.1, 180);
   private player = new THREE.Group();
+  private playerAvatar: StylizedAvatarHandle | null = null;
+  private npcAvatars = new Map<string, StylizedAvatarHandle>();
+  private isWalking = false;
   private plumbob: THREE.Mesh;
   private solids: Solid[] = [];
   private targets: InteractiveTarget[] = [];
   private npcGroups: THREE.Group[] = [];
-  private portraits: THREE.Object3D[] = [];
   private keys = new Set<string>();
   private yaw = 0.15;
   private pitch = -0.28;
@@ -109,7 +123,7 @@ export class ExpedienteWorld {
       new THREE.MeshStandardMaterial({ color: '#34d399', emissive: '#059669', roughness: 0.3 }),
     );
     this.plumbob.scale.set(0.55, 0.7, 0.55);
-    this.plumbob.position.y = 2.25;
+    this.plumbob.position.y = 2.7;
     this.player.add(this.plumbob);
     this.buildPlayer();
     this.placeStaticTargets();
@@ -126,23 +140,46 @@ export class ExpedienteWorld {
   }
 
   populateNPCs(npcs: NPCData[]) {
-    this.portraits = this.portraits.filter((card) => !this.npcGroups.includes(card.parent as THREE.Group));
+    for (const [, avatar] of this.npcAvatars) {
+      this.scene.remove(avatar.group);
+      avatar.destroy();
+    }
+    this.npcAvatars.clear();
     for (const group of this.npcGroups) this.scene.remove(group);
     this.npcGroups = [];
     this.targets = this.targets.filter((target) => target.type !== 'npc');
+
     for (const npc of npcs) {
       const spot = NPC_SPOTS[npc.id] ?? { x: npc.deskX, z: npc.deskZ };
-      const group = this.portrait(FACES[npc.id] ?? '/sustenta/faces/carlos.png', npc.name.split(' ')[0], 0.78, 1.45);
-      group.position.set(spot.x, 0, spot.z);
-      this.scene.add(group);
-      this.npcGroups.push(group);
+      const style = NPC_STYLES[npc.id] ?? {};
+
+      const avatar = createStylizedAvatar({
+        name: npc.name.split(' ')[0],
+        role: npc.role,
+        hairColor: style.hairColor ?? npc.hairColor ?? 0x222222,
+        shirtColor: style.shirtColor ?? npc.color ?? 0x1d4ed8,
+        pantsColor: 0x1e293b,
+        hairStyle: style.hairStyle ?? 'short',
+        hasGlasses: style.hasGlasses ?? false,
+        hasBadge: true,
+        hasTicket: Boolean(npc.currentTicketId),
+        isPlayer: false,
+      });
+
+      avatar.group.position.set(spot.x, 0, spot.z);
+      avatar.group.rotation.y = spot.z < 0 ? 0 : Math.PI;
+
+      this.scene.add(avatar.group);
+      this.npcAvatars.set(npc.id, avatar);
+      this.npcGroups.push(avatar.group);
+
       this.targets.push({
         id: npc.id,
         name: npc.name,
         type: 'npc',
         x: spot.x,
         z: spot.z,
-        radius: 1.7,
+        radius: 1.8,
         label: npc.role,
         npcData: npc,
       });
@@ -167,6 +204,9 @@ export class ExpedienteWorld {
     window.removeEventListener('mouseup', this.onMouseUp);
     window.removeEventListener('mousemove', this.onMouseMove);
     window.removeEventListener('resize', this.onResize);
+    this.playerAvatar?.destroy();
+    for (const [, a] of this.npcAvatars) a.destroy();
+    this.npcAvatars.clear();
     this.renderer.dispose();
     this.renderer.domElement.remove();
   }
@@ -285,48 +325,20 @@ export class ExpedienteWorld {
     this.solid(x, 0.48, z + 0.85, 0.55, 0.7, 0.55, this.mat('#334155'));
   }
 
-  private portrait(url: string, label: string, width = 0.9, height = 1.7) {
-    const group = new THREE.Group();
-    const material = new THREE.MeshBasicMaterial({ transparent: true, side: THREE.DoubleSide, depthWrite: false });
-    const card = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
-    card.position.y = height * 0.5;
-    group.add(card);
-    new THREE.TextureLoader().load(url, (texture) => {
-      texture.colorSpace = THREE.SRGBColorSpace;
-      material.map = texture;
-      material.needsUpdate = true;
-    });
-    const shadow = new THREE.Mesh(
-      new THREE.CircleGeometry(0.38, 20),
-      new THREE.MeshBasicMaterial({ color: '#0f172a', transparent: true, opacity: 0.28 }),
-    );
-    shadow.rotation.x = -Math.PI / 2;
-    shadow.position.y = 0.03;
-    group.add(shadow);
-    const canvas = document.createElement('canvas');
-    canvas.width = 256;
-    canvas.height = 64;
-    const ctx = canvas.getContext('2d')!;
-    ctx.fillStyle = 'rgba(15,23,42,0.88)';
-    ctx.beginPath();
-    ctx.roundRect(28, 10, 200, 44, 12);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 28px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(label.toUpperCase(), 128, 32);
-    const tag = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true }));
-    tag.position.y = height + 0.22;
-    tag.scale.set(1.35, 0.34, 1);
-    group.add(tag);
-    this.portraits.push(card);
-    return group;
-  }
-
   private buildPlayer() {
-    const card = this.portrait('/sustenta/faces/marcelo.png', 'Marcelo', 0.95, 1.85);
-    this.player.add(card);
+    this.playerAvatar = createStylizedAvatar({
+      name: 'Marcelo',
+      role: 'Key User SAP',
+      hairColor: 0x241711,
+      shirtColor: 0x1d4ed8, // Royal blue corporate shirt as requested
+      pantsColor: 0x1e293b,
+      skinTone: 0xf5d0b1,
+      hairStyle: 'short',
+      hasGlasses: true,
+      hasBadge: true,
+      isPlayer: true,
+    });
+    this.player.add(this.playerAvatar.group);
     this.player.position.copy(this.pos);
     this.scene.add(this.player);
   }
@@ -370,16 +382,27 @@ export class ExpedienteWorld {
     if (this.keys.has('s') || this.keys.has('arrowdown')) dir.add(forward.clone().negate());
     if (this.keys.has('a') || this.keys.has('arrowleft')) dir.add(right.clone().negate());
     if (this.keys.has('d') || this.keys.has('arrowright')) dir.add(right);
+
     if (dir.lengthSq() === 0) {
       this.player.position.y = 0;
+      this.isWalking = false;
       return;
     }
+
+    this.isWalking = true;
     dir.normalize();
     const speed = this.keys.has('shift') ? 7.2 : 4.4;
     const next = this.pos.clone().addScaledVector(dir, speed * dt);
     if (!this.blocked(next.x, this.pos.z)) this.pos.x = next.x;
     if (!this.blocked(this.pos.x, next.z)) this.pos.z = next.z;
     this.player.position.set(this.pos.x, Math.sin(this.clock.elapsedTime * 10) * 0.03, this.pos.z);
+
+    // Smoothly orient 3D player model in walking direction
+    const angle = Math.atan2(dir.x, dir.z);
+    if (this.playerAvatar) {
+      this.playerAvatar.group.rotation.set(0, angle, 0);
+    }
+
     this.step += dt;
     if (this.step > 0.38) {
       this.step = 0;
@@ -392,13 +415,6 @@ export class ExpedienteWorld {
     const offset = new THREE.Vector3(Math.sin(this.yaw) * 5.4, 2.35, Math.cos(this.yaw) * 5.4);
     this.camera.position.lerp(look.clone().add(offset), 0.14);
     this.camera.lookAt(look);
-    const faceAt = new THREE.Vector3();
-    for (const card of this.portraits) {
-      card.getWorldPosition(faceAt);
-      const dx = this.camera.position.x - faceAt.x;
-      const dz = this.camera.position.z - faceAt.z;
-      card.rotation.set(0, Math.atan2(dx, dz), 0);
-    }
   }
 
   private updateProximity() {
@@ -438,8 +454,17 @@ export class ExpedienteWorld {
     const dt = Math.min(this.clock.getDelta(), 0.05);
     if (!this.active) return;
     if (!this.suspended) this.move(dt);
+
+    const time = this.clock.elapsedTime;
     this.plumbob.rotation.y += dt * 2;
-    this.plumbob.position.y = 2.25 + Math.sin(this.clock.elapsedTime * 3) * 0.05;
+    this.plumbob.position.y = 2.7 + Math.sin(time * 3) * 0.05;
+
+    // Update 3D avatar animations (walking legs & arms swing, idle breathing & floating bubbles)
+    this.playerAvatar?.updateAnimation(time, this.isWalking, this.keys.has('shift') ? 1.35 : 1.0);
+    for (const [, avatar] of this.npcAvatars) {
+      avatar.updateAnimation(time, false);
+    }
+
     this.updateCamera();
     this.updateProximity();
     this.renderer.render(this.scene, this.camera);

@@ -1,5 +1,18 @@
 import { createServerFn } from '@tanstack/react-start';
+import { z } from 'zod';
 import type { EvidenceSubmission, EvaluationResult } from './evaluate-rules.ts';
+
+const evidenceSubmissionSchema = z.object({
+  impact: z.string().catch(''),
+  period: z.string().catch(''),
+  steps: z.string().catch(''),
+  log: z.string().catch(''),
+  specialist: z.string().catch(''),
+  qasEnvironment: z.string().catch(''),
+  qasResult: z.string().catch(''),
+  solution: z.string().catch(''),
+  nextStep: z.string().catch(''),
+});
 
 const audits: { id: string; at: string; approved: boolean }[] = [];
 
@@ -8,7 +21,7 @@ function clip(value: unknown, max = 500) {
 }
 
 export const evaluateMission = createServerFn({ method: 'POST' })
-  .inputValidator((data: EvidenceSubmission) => data)
+  .validator((data: unknown) => evidenceSubmissionSchema.parse(data))
   .handler(async ({ data }): Promise<EvaluationResult> => {
     const { evaluateSubmission } = await import('./evaluate-rules.ts');
     const submission: EvidenceSubmission = {

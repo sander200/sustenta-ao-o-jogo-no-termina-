@@ -7,12 +7,12 @@ import {
   createGlassDecalTexture,
   createMarceloBillboard,
   createC2CBadgeTexture,
-  createSabastianBillboard,
   createSapMonitorTexture,
   createServerRackTexture,
   createSimsPlumbob,
   createWoodParquetTexture,
 } from './textures.ts';
+import { createDetailedHumanAvatar } from './StylizedAvatar.ts';
 
 export interface InteractiveTarget {
   id: string;
@@ -878,40 +878,20 @@ export class OfficeScene {
     this.interactiveTargets = this.interactiveTargets.filter((t) => t.type !== 'npc');
 
     npcList.forEach((npc) => {
-      const group = new THREE.Group();
-
-      const shadow = new THREE.Mesh(
-        new THREE.CircleGeometry(0.35, 16),
-        new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.35 })
+      const isFemale = ['npc_bruna_folha', 'npc_juliana_cadastro', 'npc_mariana_funcional', 'npc_tania_cafe'].includes(npc.id);
+      const group = createDetailedHumanAvatar(
+        npc.name.split(' ')[0],
+        npc.role,
+        isFemale,
+        npc.hairColor,
+        npc.color,
+        Boolean(npc.currentTicketId)
       );
-      shadow.rotation.x = -Math.PI / 2;
-      shadow.position.y = 0.02;
-      group.add(shadow);
 
-      const bodyMat = new THREE.MeshStandardMaterial({ color: npc.color, roughness: 0.6 });
-      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.3, 0.75, 12), bodyMat);
-      body.position.y = 0.65;
-      body.castShadow = !this.isSoftwareGl;
-      group.add(body);
-
-      const headMat = new THREE.MeshStandardMaterial({ color: 0xfbcfe8, roughness: 0.4 });
-      const head = new THREE.Mesh(new THREE.SphereGeometry(0.25, 12, 12), headMat);
-      head.position.y = 1.25;
-      head.castShadow = !this.isSoftwareGl;
-      group.add(head);
-
-      const hairMat = new THREE.MeshStandardMaterial({ color: npc.hairColor, roughness: 0.8 });
-      const hair = new THREE.Mesh(new THREE.SphereGeometry(0.27, 12, 12), hairMat);
-      hair.position.set(0, 1.32, -0.02);
-      hair.scale.set(1.02, 0.6, 1.05);
-      group.add(hair);
-
-      // Speech bubble sprite on top
-      const bubble = this.createNPCSpeechBubble(Boolean(npc.currentTicketId));
-      bubble.position.set(0, 1.85, 0);
-      group.add(bubble);
+      const bubble = (group.userData.bubble as THREE.Sprite) || this.createNPCSpeechBubble(Boolean(npc.currentTicketId));
 
       group.position.set(npc.deskX, 0, npc.deskZ + 0.8);
+      group.rotation.y = npc.deskZ < 0 ? 0 : Math.PI;
       this.scene.add(group);
 
       this.npcs.set(npc.id, { group, data: npc, bubble });
@@ -1232,7 +1212,7 @@ export class OfficeScene {
 
     // NPC Floating Bubbles
     this.npcs.forEach((npcObj) => {
-      npcObj.bubble.position.y = 1.85 + Math.sin(time * 3 + npcObj.data.deskX) * 0.06;
+      npcObj.bubble.position.y = 2.8 + Math.sin(time * 3 + npcObj.data.deskX) * 0.06;
     });
   }
 
