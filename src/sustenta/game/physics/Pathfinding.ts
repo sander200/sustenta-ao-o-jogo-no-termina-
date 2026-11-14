@@ -11,10 +11,10 @@ export interface CollisionBox {
 export class CollisionSystem {
   public obstacles: CollisionBox[] = [];
   public gridResolution: number = 0.5; // 0.5m grid
-  private minX: number = -22;
-  private maxX: number = 22;
-  private minZ: number = -17;
-  private maxZ: number = 17;
+  private minX: number = -23;
+  private maxX: number = 23;
+  private minZ: number = -18;
+  private maxZ: number = 18;
   private gridWidth: number = 0;
   private gridHeight: number = 0;
   private walkableGrid: boolean[][] = [];
@@ -43,8 +43,8 @@ export class CollisionSystem {
   }
 
   private rasterizeBox(box: CollisionBox) {
-    // Add small buffer for player radius (0.4m)
-    const buffer = 0.35;
+    // Keep a body-width gap so people don't scrape through glass or desk edges
+    const buffer = 0.42;
     const startX = Math.max(0, Math.floor((box.minX - buffer - this.minX) / this.gridResolution));
     const endX = Math.min(this.gridWidth - 1, Math.ceil((box.maxX + buffer - this.minX) / this.gridResolution));
     const startZ = Math.max(0, Math.floor((box.minZ - buffer - this.minZ) / this.gridResolution));
@@ -96,6 +96,31 @@ export class CollisionSystem {
     return { x: targetX, z: targetZ };
   }
 
+  /**
+   * Step in small slices so a fast move cannot jump a thin glass wall.
+   */
+  public moveCircle(
+    x: number,
+    z: number,
+    dx: number,
+    dz: number,
+    radius: number = 0.4
+  ): { x: number; z: number } {
+    const dist = Math.hypot(dx, dz);
+    if (dist < 1e-5) return { x, z };
+    const slices = Math.max(1, Math.ceil(dist / 0.1));
+    let cx = x;
+    let cz = z;
+    for (let i = 1; i <= slices; i++) {
+      const nx = x + (dx * i) / slices;
+      const nz = z + (dz * i) / slices;
+      const resolved = this.resolveMovement(cx, cz, nx, nz, radius);
+      cx = resolved.x;
+      cz = resolved.z;
+    }
+    return { x: cx, z: cz };
+  }
+
   public isPointWalkable(x: number, z: number): boolean {
     if (x < this.minX || x > this.maxX || z < this.minZ || z > this.maxZ) return false;
     const gx = Math.floor((x - this.minX) / this.gridResolution);
@@ -104,12 +129,49 @@ export class CollisionSystem {
     return this.walkableGrid[gz][gx];
   }
 
+  public findNearestWalkable(x: number, z: number, maxRadiusCells: number = 10): { x: number; z: number } {
+    const startGX = Math.max(0, Math.min(this.gridWidth - 1, Math.floor((x - this.minX) / this.gridResolution)));
+    const startGZ = Math.max(0, Math.min(this.gridHeight - 1, Math.floor((z - this.minZ) / this.gridResolution)));
+
+    if (this.walkableGrid[startGZ][startGX]) {
+      return { x, z };
+    }
+
+    let bestGX = startGX;
+    let bestGZ = startGZ;
+    let bestDistSq = Infinity;
+
+    for (let r = 1; r <= maxRadiusCells; r++) {
+      for (let dz = -r; dz <= r; dz++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const nx = startGX + dx;
+          const nz = startGZ + dz;
+          if (nz >= 0 && nz < this.gridHeight && nx >= 0 && nx < this.gridWidth && this.walkableGrid[nz][nx]) {
+            const dSq = dx * dx + dz * dz;
+            if (dSq < bestDistSq) {
+              bestDistSq = dSq;
+              bestGX = nx;
+              bestGZ = nz;
+            }
+          }
+        }
+      }
+      if (bestDistSq < Infinity) break;
+    }
+
+    return {
+      x: this.minX + (bestGX + 0.5) * this.gridResolution,
+      z: this.minZ + (bestGZ + 0.5) * this.gridResolution,
+    };
+  }
+
   /**
    * A* Pathfinding algorithm to navigate around walls and doors
    */
   public findPath(startX: number, startZ: number, goalX: number, goalZ: number): { x: number; z: number }[] {
-    const startGX = Math.max(0, Math.min(this.gridWidth - 1, Math.floor((startX - this.minX) / this.gridResolution)));
-    const startGZ = Math.max(0, Math.min(this.gridHeight - 1, Math.floor((startZ - this.minZ) / this.gridResolution)));
+    const snapped = this.findNearestWalkable(startX, startZ, 8);
+    const startGX = Math.max(0, Math.min(this.gridWidth - 1, Math.floor((snapped.x - this.minX) / this.gridResolution)));
+    const startGZ = Math.max(0, Math.min(this.gridHeight - 1, Math.floor((snapped.z - this.minZ) / this.gridResolution)));
     let goalGX = Math.max(0, Math.min(this.gridWidth - 1, Math.floor((goalX - this.minX) / this.gridResolution)));
     let goalGZ = Math.max(0, Math.min(this.gridHeight - 1, Math.floor((goalZ - this.minZ) / this.gridResolution)));
 
@@ -173,7 +235,7 @@ export class CollisionSystem {
       { dx: -1, dz: -1, cost: 1.414 },
     ];
 
-    let maxSteps = 1200;
+    let maxSteps = 6000;
     while (openList.length > 0 && maxSteps-- > 0) {
       // Find lowest f node
       let lowestIdx = 0;
@@ -241,8 +303,8 @@ export class CollisionSystem {
       }
     }
 
-    // Fallback: direct line to closest accessible
-    return [{ x: goalX, z: goalZ }];
+    // Never fall back to a straight line — that walks through walls, desks and glass.
+    return [];
   }
 
   private smoothPath(rawPath: { x: number; z: number }[]): { x: number; z: number }[] {

@@ -1,23 +1,27 @@
 import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { CollisionSystem } from '../physics/Pathfinding.ts';
 import { NPCData } from '../types.ts';
 import {
-  createCarpetTexture,
-  createCeramicTileTexture,
-  createGlassDecalTexture,
-  createMarceloBillboard,
-  createC2CBadgeTexture,
-  createSapMonitorTexture,
-  createServerRackTexture,
-  createSimsPlumbob,
-  createWoodParquetTexture,
-} from './textures.ts';
-import { createDetailedHumanAvatar } from './StylizedAvatar.ts';
+  buildHumanCharacter,
+  CharacterInstance,
+  getMarceloAppearance,
+  getNPCAppearance,
+} from './CharacterBuilder.ts';
+import { createOfficeMaterialLibrary, OfficeMaterialLibrary } from './materials.ts';
+import { buildCorporateOffice, OfficeBuildResult } from './OfficeBuilder.ts';
+import {
+  CREW_SPRITES,
+  CutoutSprite,
+  type CutoutMode,
+} from './CutoutSprite.ts';
+import { MarceloSprite, MarceloMove } from './MarceloSprite.ts';
+import { createGlassDecalTexture, createSimsPlumbob } from './textures.ts';
 
 export interface InteractiveTarget {
   id: string;
   name: string;
-  type: 'npc' | 'desk' | 'coffee' | 'restaurant' | 'restroom' | 'server' | 'meeting' | 'pool_table' | 'academy';
+  type: 'npc' | 'desk' | 'coffee' | 'restaurant' | 'restroom' | 'server' | 'meeting' | 'pool_table';
   x: number;
   z: number;
   radius: number;
@@ -25,47 +29,959 @@ export interface InteractiveTarget {
   npcData?: NPCData;
 }
 
+export type NPCFSMState = 'idle' | 'walking' | 'talking';
+export type NPCTaskType = 'desk_work' | 'meeting' | 'coffee' | 'infra_check' | 'colleague_visit';
+export type NPCWalkPhase = 'stepping_out' | 'pathing' | 'stepping_in';
+
+export interface NPCSpot {
+  x: number;
+  z: number;
+  yaw: number;
+  anim: 'talking' | 'coffee' | 'idle' | 'interacting';
+  holdCoffee: boolean;
+}
+
+const MEETING_ROOM_CENTER = { x: -16.8, z: 0.5 };
+
+const MEETING_SPOTS: NPCSpot[] = [
+  { x: -14.4, z: -0.6, yaw: -Math.PI * 0.55, anim: 'talking', holdCoffee: false },
+  { x: -14.4, z: 1.6, yaw: -Math.PI * 0.45, anim: 'idle', holdCoffee: false },
+  { x: -19.2, z: 0.4, yaw: Math.PI * 0.5, anim: 'talking', holdCoffee: false },
+  { x: -16.8, z: 4.1, yaw: Math.PI, anim: 'talking', holdCoffee: false },
+];
+
+const COFFEE_SPOTS: NPCSpot[] = [
+  { x: 16.6, z: 14.3, yaw: 0.15, anim: 'coffee', holdCoffee: true },
+  { x: 18.8, z: 14.2, yaw: -0.4, anim: 'coffee', holdCoffee: true },
+  { x: 14.4, z: 13.4, yaw: 0.85, anim: 'talking', holdCoffee: true },
+  { x: 15.2, z: 11.4, yaw: 1.15, anim: 'coffee', holdCoffee: true },
+  { x: 10.2, z: 13.8, yaw: -0.55, anim: 'coffee', holdCoffee: true },
+];
+
+const VISIT_SPOTS: NPCSpot[] = [
+  { x: -1.6, z: -8.2, yaw: Math.PI, anim: 'idle', holdCoffee: false },
+  { x: 1.8, z: 4.5, yaw: -Math.PI * 0.35, anim: 'talking', holdCoffee: true },
+  { x: -5.6, z: 9.2, yaw: 0.2, anim: 'coffee', holdCoffee: true },
+  { x: 8.2, z: -1.8, yaw: Math.PI * 0.5, anim: 'talking', holdCoffee: false },
+  { x: -14.2, z: -12.4, yaw: Math.PI * 0.25, anim: 'talking', holdCoffee: false },
+];
+
+const INFRA_SPOTS: NPCSpot[] = [
+  { x: 11.5, z: -12.6, yaw: Math.PI, anim: 'interacting', holdCoffee: false },
+  { x: 14.0, z: -12.6, yaw: Math.PI, anim: 'idle', holdCoffee: false },
+];
+
+function createSpeechBubbleTexture(hasTicket: boolean): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = 140;
+  canvas.height = 140;
+  const ctx = canvas.getContext('2d')!;
+
+  const bColor = hasTicket ? '#facc15' : '#ffffff';
+  const bBorder = hasTicket ? '#ca8a04' : '#94a3b8';
+
+  ctx.fillStyle = bColor;
+  ctx.strokeStyle = bBorder;
+  ctx.lineWidth = 4;
+
+  ctx.beginPath();
+  ctx.roundRect(14, 14, 112, 84, 18);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(56, 98);
+  ctx.lineTo(70, 124);
+  ctx.lineTo(84, 98);
+  ctx.closePath();
+  ctx.fillStyle = bColor;
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = bColor;
+  ctx.fillRect(54, 94, 32, 6);
+
+  ctx.fillStyle = '#0f172a';
+  ctx.textAlign = 'center';
+  if (hasTicket) {
+    ctx.font = 'bold 56px "Chakra Petch", sans-serif';
+    ctx.fillText('!', 70, 74);
+  } else {
+    ctx.font = 'bold 40px "Chakra Petch", sans-serif';
+    ctx.fillText('···', 70, 68);
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+export class NPCStateMachine {
+  public state: NPCFSMState = 'idle';
+  public task: NPCTaskType = 'desk_work';
+  public walkPhase: NPCWalkPhase = 'pathing';
+  public stateTimer: number;
+  public talkToggleTimer: number;
+  public destination: NPCSpot | null = null;
+  public path: { x: number; z: number }[] = [];
+  public pathIdx: number = 0;
+
+  constructor(initialIdleSec: number) {
+    this.stateTimer = initialIdleSec;
+    this.talkToggleTimer = 3 + Math.random() * 3;
+  }
+
+  public transitionTo(next: NPCFSMState) {
+    if (this.state === next) return;
+    this.state = next;
+    this.talkToggleTimer = 2.6 + Math.random() * 3.4;
+  }
+
+  public isAtHomeSeat(isDeskSeated: boolean): boolean {
+    return (
+      isDeskSeated &&
+      this.task === 'desk_work' &&
+      this.state !== 'walking'
+    );
+  }
+}
+
+export interface ManagedNPC {
+  char: CharacterInstance;
+  data: NPCData;
+  bubble: THREE.Sprite;
+  hasTicketBubble: boolean;
+  nameTagEl: HTMLDivElement;
+  nameBadgeEl: HTMLSpanElement;
+  interactiveTarget: InteractiveTarget;
+  isDeskSeated: boolean;
+  homeX: number;
+  homeZ: number;
+  homeYaw: number;
+  aisleX: number;
+  aisleZ: number;
+  walkSpeed: number;
+  calmSpeed: number;
+  fleeing: boolean;
+  fleeRetarget: number;
+  stuckTime: number;
+  fsm: NPCStateMachine;
+  cutout?: CutoutSprite;
+}
+
+export class NPCCharacterManager {
+  private npcs: Map<string, ManagedNPC> = new Map();
+  private groupMeetingCooldown: number = 3.2;
+  private gameTimeMinutes: number = 540;
+  private lastScheduledSlot: number = -1;
+
+  constructor(
+    private scene: THREE.Scene,
+    private collisionSystem: CollisionSystem,
+    private nameTagLayer: HTMLDivElement
+  ) {}
+
+  public setGameTime(timeMinutes: number) {
+    this.gameTimeMinutes = timeMinutes;
+    const slot = Math.floor(timeMinutes / 10);
+
+    if (this.lastScheduledSlot === -1) {
+      this.lastScheduledSlot = slot;
+      return;
+    }
+
+    if (slot > this.lastScheduledSlot) {
+      this.lastScheduledSlot = slot;
+      if (slot % 2 === 0) {
+        this.scheduleAutonomousGroupMeeting();
+      } else {
+        this.scheduleCoffeeBreakWave();
+      }
+    }
+  }
+
+  private createNameTagElement(npc: NPCData): {
+    el: HTMLDivElement;
+    badge: HTMLSpanElement;
+  } {
+    const el = document.createElement('div');
+    el.className = 'name-tag';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = npc.name;
+
+    const shortRole = npc.role.split(/[·(/]/)[0].trim();
+    const roleSpan = document.createElement('span');
+    roleSpan.className = 'name-tag__role';
+    roleSpan.textContent = shortRole;
+
+    const badge = document.createElement('span');
+    badge.className = 'name-tag__badge';
+    badge.textContent = '!';
+    badge.style.display = npc.currentTicketId ? 'inline-flex' : 'none';
+
+    el.appendChild(nameSpan);
+    el.appendChild(roleSpan);
+    el.appendChild(badge);
+    this.nameTagLayer.appendChild(el);
+    return { el, badge };
+  }
+
+  private createNPCSpeechBubble(hasTicket: boolean): THREE.Sprite {
+    const texture = createSpeechBubbleTexture(hasTicket);
+    const spriteMat = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
+    });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.scale.set(0.36, 0.36, 1);
+    return sprite;
+  }
+
+  public syncNPCs(
+    npcList: NPCData[],
+    existingTargets: InteractiveTarget[],
+    isSoftwareGl: boolean
+  ): InteractiveTarget[] {
+    const incomingIds = new Set(npcList.map((n) => n.id));
+
+    // Remove NPCs no longer present
+    this.npcs.forEach((managed, id) => {
+      if (!incomingIds.has(id)) {
+        this.scene.remove(managed.char.rig.root);
+        managed.cutout?.dispose();
+        managed.nameTagEl.remove();
+        (managed.bubble.material as THREE.SpriteMaterial).map?.dispose();
+        (managed.bubble.material as THREE.SpriteMaterial).dispose();
+        this.npcs.delete(id);
+      }
+    });
+
+    const nonNpcTargets = existingTargets.filter((t) => t.type !== 'npc');
+    const updatedNpcTargets: InteractiveTarget[] = [];
+
+    npcList.forEach((npc, idx) => {
+      const existing = this.npcs.get(npc.id);
+      const hasTicket = Boolean(npc.currentTicketId);
+
+      if (existing) {
+        // Preserve live 3D rig & FSM state across React ticket state updates
+        existing.data = npc;
+        existing.interactiveTarget.npcData = npc;
+        existing.interactiveTarget.label = `Falar com ${npc.name} (${npc.role})`;
+        existing.nameBadgeEl.style.display = hasTicket ? 'inline-flex' : 'none';
+
+        if (existing.hasTicketBubble !== hasTicket) {
+          const mat = existing.bubble.material as THREE.SpriteMaterial;
+          mat.map?.dispose();
+          mat.map = createSpeechBubbleTexture(hasTicket);
+          mat.needsUpdate = true;
+          existing.hasTicketBubble = hasTicket;
+        }
+
+        updatedNpcTargets.push(existing.interactiveTarget);
+        return;
+      }
+
+      const appearance = getNPCAppearance(npc.id, npc.color, npc.hairColor);
+      if (!CREW_SPRITES[npc.id]) {
+        appearance.heightScale = appearance.gender === 'female' ? 0.88 : 0.9;
+      }
+      const char = buildHumanCharacter(appearance, !isSoftwareGl);
+
+      const isRoaming = npc.id === 'npc_tania_cafe' || Boolean(CREW_SPRITES[npc.id]);
+      const isManager = npc.id === 'npc_gestor_marcos';
+
+      const posX = isManager ? -12.2 : npc.deskX;
+      const posZ = isRoaming ? npc.deskZ : isManager ? -9.93 : npc.deskZ + 0.72;
+      const baseYaw = isRoaming ? -Math.PI * 0.25 : Math.PI;
+      const aisleAnchor = this.collisionSystem.findNearestWalkable(
+        posX,
+        isRoaming ? posZ : posZ + 0.85
+      );
+
+      const spawnX = isRoaming ? aisleAnchor.x : posX;
+      const spawnZ = isRoaming ? aisleAnchor.z : posZ;
+      char.rig.root.position.set(spawnX, 0, spawnZ);
+      char.rig.root.rotation.y = baseYaw;
+
+      const initialAnim = isRoaming ? 'idle' : idx % 3 === 0 ? 'sit' : 'typing';
+      char.setAnimation(initialAnim, 0.01);
+      char.mixer.setTime(idx * 0.43);
+
+      // Subtle speech/alert icon offset to upper-right so it never collides with the billboarded .name-tag
+      const bubble = this.createNPCSpeechBubble(hasTicket);
+      bubble.position.set(0.4, isRoaming ? 2.02 : 1.72, 0);
+      char.rig.root.add(bubble);
+
+      this.scene.add(char.rig.root);
+
+      const { el: nameTagEl, badge: nameBadgeEl } = this.createNameTagElement(npc);
+
+      const interactiveTarget: InteractiveTarget = {
+        id: npc.id,
+        name: npc.name,
+        type: 'npc',
+        x: posX,
+        z: posZ + 0.4,
+        radius: 2.1,
+        label: `Falar com ${npc.name} (${npc.role})`,
+        npcData: npc,
+      };
+
+      let initialTimer = 9 + (idx % 5) * 4.2;
+      if (npc.id === 'npc_carlos_beneficios') initialTimer = 1.8;
+      else if (npc.id === 'npc_fabio_basis') initialTimer = 4.6;
+      else if (npc.id === 'npc_tania_cafe') initialTimer = 3.5;
+      else if (npc.id === 'npc_bruna_folha') initialTimer = 18.0;
+      else if (CREW_SPRITES[npc.id]) initialTimer = 2.2 + (idx % 4) * 1.4;
+
+      const crewFrames = CREW_SPRITES[npc.id];
+      let cutout: CutoutSprite | undefined;
+      if (crewFrames) {
+        char.rig.root.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (mesh.isMesh) mesh.visible = false;
+        });
+        cutout = new CutoutSprite(crewFrames, () => {
+          char.rig.root.traverse((obj) => {
+            const mesh = obj as THREE.Mesh;
+            if (mesh.isMesh) mesh.visible = false;
+          });
+        });
+        cutout.group.position.set(posX, 0, posZ);
+        this.scene.add(cutout.group);
+        cutout.load(8);
+      }
+
+      const managed: ManagedNPC = {
+        char,
+        data: npc,
+        bubble,
+        hasTicketBubble: hasTicket,
+        nameTagEl,
+        nameBadgeEl,
+        interactiveTarget,
+        isDeskSeated: !isRoaming,
+        homeX: posX,
+        homeZ: posZ,
+        homeYaw: baseYaw,
+        aisleX: aisleAnchor.x,
+        aisleZ: aisleAnchor.z,
+        walkSpeed: npc.id === 'npc_sand' ? 2.55 : 1.78 + (idx % 3) * 0.16,
+        calmSpeed: npc.id === 'npc_sand' ? 2.55 : 1.78 + (idx % 3) * 0.16,
+        fleeing: false,
+        fleeRetarget: 0,
+        stuckTime: 0,
+        fsm: new NPCStateMachine(initialTimer),
+        cutout,
+      };
+
+      this.npcs.set(npc.id, managed);
+      updatedNpcTargets.push(interactiveTarget);
+    });
+
+    return [...nonNpcTargets, ...updatedNpcTargets];
+  }
+
+  private assignTaskToNpc(
+    managed: ManagedNPC,
+    task: NPCTaskType,
+    spot: NPCSpot | null,
+    durationSec: number
+  ) {
+    const fsm = managed.fsm;
+    const prevTask = fsm.task;
+    const wasAtHomeSeat = fsm.isAtHomeSeat(managed.isDeskSeated);
+    fsm.task = task;
+    fsm.stateTimer = durationSec;
+
+    if (task === 'desk_work') {
+      fsm.destination = {
+        x: managed.homeX,
+        z: managed.homeZ,
+        yaw: managed.homeYaw,
+        anim: 'idle',
+        holdCoffee: false,
+      };
+      if (prevTask !== 'desk_work' || !wasAtHomeSeat) {
+        const curr = managed.char.rig.root.position;
+        const start = this.collisionSystem.findNearestWalkable(curr.x, curr.z);
+        fsm.path = this.collisionSystem.findPath(start.x, start.z, managed.aisleX, managed.aisleZ);
+        fsm.pathIdx = 0;
+        fsm.walkPhase = 'pathing';
+        fsm.transitionTo('walking');
+      }
+      return;
+    }
+
+    if (!spot) return;
+    const safeSpot = this.collisionSystem.findNearestWalkable(spot.x, spot.z);
+    fsm.destination = { ...spot, x: safeSpot.x, z: safeSpot.z };
+    managed.char.setHoldingCoffee(false);
+
+    if (wasAtHomeSeat) {
+      // Smoothly step out from ergonomic chair to corridor before A* pathing
+      fsm.walkPhase = 'stepping_out';
+      fsm.path = [];
+      fsm.pathIdx = 0;
+      fsm.transitionTo('walking');
+    } else {
+      // Fluidly transition from current room (e.g. Sala de Reuniões -> Área de Café) directly!
+      const curr = managed.char.rig.root.position;
+      const start = this.collisionSystem.findNearestWalkable(curr.x, curr.z);
+      fsm.path = this.collisionSystem.findPath(start.x, start.z, safeSpot.x, safeSpot.z);
+      fsm.pathIdx = 0;
+      fsm.walkPhase = 'pathing';
+      fsm.transitionTo('walking');
+    }
+  }
+
+  private scheduleAutonomousGroupMeeting() {
+    const candidates = Array.from(this.npcs.values()).filter(
+      (m) => m.fsm.state !== 'walking' && m.fsm.task !== 'meeting' && m.data.id !== 'npc_tania_cafe'
+    );
+    if (candidates.length < 2) return;
+
+    const shuffled = [...candidates].sort(() => Math.random() - 0.5);
+    const attendees = shuffled.slice(0, Math.min(3, shuffled.length));
+    const meetingDuration = 18 + Math.random() * 8;
+
+    attendees.forEach((managed, idx) => {
+      const spot = MEETING_SPOTS[idx % MEETING_SPOTS.length];
+      this.assignTaskToNpc(managed, 'meeting', spot, meetingDuration + idx * 1.5);
+    });
+  }
+
+  private scheduleCoffeeBreakWave() {
+    // Move colleagues from Sala de Reunião or desks directly to Área de Café based on game time
+    const meetingAttendees = Array.from(this.npcs.values()).filter(
+      (m) => m.fsm.state !== 'walking' && m.fsm.task === 'meeting'
+    );
+    const deskWorkers = Array.from(this.npcs.values()).filter(
+      (m) => m.fsm.state !== 'walking' && m.fsm.task === 'desk_work' && m.data.id !== 'npc_tania_cafe'
+    );
+
+    const pool = [...meetingAttendees, ...deskWorkers.sort(() => Math.random() - 0.5)].slice(0, 3);
+    pool.forEach((managed, idx) => {
+      const spot = COFFEE_SPOTS[idx % COFFEE_SPOTS.length];
+      this.assignTaskToNpc(managed, 'coffee', spot, 14 + Math.random() * 7);
+    });
+  }
+
+  private routeSpriteCrew(managed: ManagedNPC): boolean {
+    const id = managed.data.id;
+    if (!CREW_SPRITES[id]) return false;
+    const roll = Math.random();
+    const coffee = () => COFFEE_SPOTS[Math.floor(Math.random() * COFFEE_SPOTS.length)];
+    const visit = () => VISIT_SPOTS[Math.floor(Math.random() * VISIT_SPOTS.length)];
+    const meeting = () => MEETING_SPOTS[Math.floor(Math.random() * MEETING_SPOTS.length)];
+
+    if (id === 'npc_wbiondi' || id === 'npc_vanesa') {
+      if (roll < 0.72) this.assignTaskToNpc(managed, 'coffee', coffee(), 14 + Math.random() * 10);
+      else this.assignTaskToNpc(managed, 'colleague_visit', visit(), 10 + Math.random() * 8);
+      return true;
+    }
+    if (id === 'npc_gustavo') {
+      if (roll < 0.5) this.assignTaskToNpc(managed, 'coffee', coffee(), 16 + Math.random() * 10);
+      else if (roll < 0.85) this.assignTaskToNpc(managed, 'colleague_visit', visit(), 12 + Math.random() * 8);
+      else this.assignTaskToNpc(managed, 'desk_work', null, 6 + Math.random() * 5);
+      return true;
+    }
+    if (id === 'npc_camilinha') {
+      if (roll < 0.7) this.assignTaskToNpc(managed, 'colleague_visit', visit(), 8 + Math.random() * 6);
+      else this.assignTaskToNpc(managed, 'meeting', meeting(), 10 + Math.random() * 6);
+      return true;
+    }
+    if (roll < 0.4) this.assignTaskToNpc(managed, 'coffee', coffee(), 12 + Math.random() * 8);
+    else if (roll < 0.75) this.assignTaskToNpc(managed, 'colleague_visit', visit(), 10 + Math.random() * 7);
+    else this.assignTaskToNpc(managed, 'meeting', meeting(), 12 + Math.random() * 6);
+    return true;
+  }
+
+  private pickNextTaskForNpc(managed: ManagedNPC) {
+    if (this.routeSpriteCrew(managed)) return;
+    const prevTask = managed.fsm.task;
+
+    // Fluidly transition after a Meeting: ~55% go straight to Área de Café, ~45% return to desk
+    if (prevTask === 'meeting') {
+      if (Math.random() < 0.55) {
+        const s = COFFEE_SPOTS[Math.floor(Math.random() * COFFEE_SPOTS.length)];
+        this.assignTaskToNpc(managed, 'coffee', s, 14 + Math.random() * 8);
+      } else {
+        this.assignTaskToNpc(managed, 'desk_work', null, 20 + Math.random() * 18);
+      }
+      return;
+    }
+
+    // After Coffee: ~25% move directly to Meeting Room or visit a colleague, ~75% return to desk
+    if (prevTask === 'coffee') {
+      if (managed.data.id === 'npc_tania_cafe') {
+        const pool = Math.random() < 0.65 ? COFFEE_SPOTS : VISIT_SPOTS;
+        const s = pool[Math.floor(Math.random() * pool.length)];
+        this.assignTaskToNpc(managed, 'coffee', s, 12 + Math.random() * 10);
+        return;
+      }
+      const roll = Math.random();
+      if (roll < 0.22) {
+        const s = MEETING_SPOTS[Math.floor(Math.random() * MEETING_SPOTS.length)];
+        this.assignTaskToNpc(managed, 'meeting', s, 14 + Math.random() * 8);
+      } else if (roll < 0.35) {
+        const s = VISIT_SPOTS[Math.floor(Math.random() * VISIT_SPOTS.length)];
+        this.assignTaskToNpc(managed, 'colleague_visit', s, 10 + Math.random() * 6);
+      } else {
+        this.assignTaskToNpc(managed, 'desk_work', null, 22 + Math.random() * 18);
+      }
+      return;
+    }
+
+    // From Colleague Visit or Infra Check: return to desk or swing by Café
+    if (prevTask === 'colleague_visit' || prevTask === 'infra_check') {
+      if (Math.random() < 0.38) {
+        const s = COFFEE_SPOTS[Math.floor(Math.random() * COFFEE_SPOTS.length)];
+        this.assignTaskToNpc(managed, 'coffee', s, 12 + Math.random() * 7);
+      } else {
+        this.assignTaskToNpc(managed, 'desk_work', null, 20 + Math.random() * 18);
+      }
+      return;
+    }
+
+    // From Desk Work: pick an autonomous office activity
+    if (managed.data.id === 'npc_fabio_basis' && Math.random() < 0.5) {
+      const s = INFRA_SPOTS[Math.floor(Math.random() * INFRA_SPOTS.length)];
+      this.assignTaskToNpc(managed, 'infra_check', s, 12 + Math.random() * 8);
+      return;
+    }
+
+    if (managed.data.id === 'npc_tania_cafe') {
+      const pool = Math.random() < 0.65 ? COFFEE_SPOTS : VISIT_SPOTS;
+      const s = pool[Math.floor(Math.random() * pool.length)];
+      this.assignTaskToNpc(managed, 'coffee', s, 12 + Math.random() * 10);
+      return;
+    }
+
+    const coffeeBias = this.gameTimeMinutes >= 840 ? 0.65 : 0.56;
+    const r = Math.random();
+    if (r < coffeeBias) {
+      const s = COFFEE_SPOTS[Math.floor(Math.random() * COFFEE_SPOTS.length)];
+      this.assignTaskToNpc(managed, 'coffee', s, 13 + Math.random() * 8);
+    } else if (r < 0.84) {
+      const s = VISIT_SPOTS[Math.floor(Math.random() * VISIT_SPOTS.length)];
+      this.assignTaskToNpc(managed, 'colleague_visit', s, 11 + Math.random() * 7);
+    } else {
+      const s = MEETING_SPOTS[Math.floor(Math.random() * MEETING_SPOTS.length)];
+      this.assignTaskToNpc(managed, 'meeting', s, 15 + Math.random() * 8);
+    }
+  }
+
+  private moveNpcAlongPoint(managed: ManagedNPC, tx: number, tz: number, dt: number, allowClip = false): boolean {
+    const pos = managed.char.rig.root.position;
+    const dx = tx - pos.x;
+    const dz = tz - pos.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist <= 0.16) return true;
+
+    const step = Math.min(dist, managed.walkSpeed * dt);
+    const mx = (dx / dist) * step;
+    const mz = (dz / dist) * step;
+    if (allowClip) {
+      pos.x += mx;
+      pos.z += mz;
+      managed.stuckTime = 0;
+    } else {
+      const resolved = this.collisionSystem.moveCircle(pos.x, pos.z, mx, mz, 0.4);
+      const moved = Math.hypot(resolved.x - pos.x, resolved.z - pos.z);
+      pos.x = resolved.x;
+      pos.z = resolved.z;
+      managed.stuckTime = moved < step * 0.35 ? managed.stuckTime + dt : 0;
+    }
+
+    const targetYaw = Math.atan2(dx, dz);
+    let deltaYaw = targetYaw - managed.char.rig.root.rotation.y;
+    while (deltaYaw > Math.PI) deltaYaw -= Math.PI * 2;
+    while (deltaYaw < -Math.PI) deltaYaw += Math.PI * 2;
+    managed.char.rig.root.rotation.y += deltaYaw * Math.min(1, dt * 8);
+    managed.char.setAnimation('walk', 0.18);
+    return false;
+  }
+
+  private yawTowardSomeone(managed: ManagedNPC, playerPos: THREE.Vector3, fallbackYaw: number): number {
+    const pos = managed.char.rig.root.position;
+    let best = 3.8;
+    let yaw = fallbackYaw;
+    const consider = (x: number, z: number) => {
+      const d = Math.hypot(x - pos.x, z - pos.z);
+      if (d < best && d > 0.35) {
+        best = d;
+        yaw = Math.atan2(x - pos.x, z - pos.z);
+      }
+    };
+    consider(playerPos.x, playerPos.z);
+    this.npcs.forEach((other) => {
+      if (other.data.id === managed.data.id) return;
+      const o = other.char.rig.root.position;
+      consider(o.x, o.z);
+    });
+    return yaw;
+  }
+
+  public nearestPerson(x: number, z: number, maxDist: number): { x: number; z: number } | null {
+    let best = maxDist;
+    let found: { x: number; z: number } | null = null;
+    this.npcs.forEach((other) => {
+      const o = other.char.rig.root.position;
+      const d = Math.hypot(o.x - x, o.z - z);
+      if (d < best && d > 0.35) {
+        best = d;
+        found = { x: o.x, z: o.z };
+      }
+    });
+    return found;
+  }
+
+  public update(dt: number, elapsed: number, playerPos: THREE.Vector3) {
+    this.groupMeetingCooldown -= dt;
+    if (this.groupMeetingCooldown <= 0) {
+      this.groupMeetingCooldown = 25 + Math.random() * 13;
+      this.scheduleAutonomousGroupMeeting();
+    }
+
+    let idx = 0;
+    this.steerSandAwayFromBiondi(dt, playerPos);
+    this.npcs.forEach((managed) => {
+      const fsm = managed.fsm;
+      const npcPos = managed.char.rig.root.position;
+      const distToPlayer = Math.hypot(npcPos.x - playerPos.x, npcPos.z - playerPos.z);
+      const isPlayerClose = distToPlayer < 2.2;
+      const isHomeSeat = fsm.isAtHomeSeat(managed.isDeskSeated);
+
+      if (fsm.state === 'walking') {
+        if (isPlayerClose) {
+          // Pause briefly to greet / talk to Marcelo if he approaches mid-walk
+          managed.char.setAnimation('talking', 0.22);
+          const lookYaw = Math.atan2(playerPos.x - npcPos.x, playerPos.z - npcPos.z);
+          managed.char.rig.root.rotation.y = THREE.MathUtils.damp(
+            managed.char.rig.root.rotation.y,
+            lookYaw,
+            6,
+            dt
+          );
+        } else if (fsm.walkPhase === 'stepping_out') {
+          if (this.moveNpcAlongPoint(managed, managed.aisleX, managed.aisleZ, dt) && fsm.destination) {
+            fsm.path = this.collisionSystem.findPath(
+              managed.aisleX,
+              managed.aisleZ,
+              fsm.destination.x,
+              fsm.destination.z
+            );
+            fsm.pathIdx = 0;
+            fsm.walkPhase = 'pathing';
+          }
+        } else if (fsm.walkPhase === 'pathing') {
+          if (fsm.pathIdx < fsm.path.length) {
+            const wp = fsm.path[fsm.pathIdx];
+            if (this.moveNpcAlongPoint(managed, wp.x, wp.z, dt)) {
+              fsm.pathIdx++;
+              managed.stuckTime = 0;
+            } else if (managed.stuckTime > 0.6) {
+              managed.stuckTime = 0;
+              const dest = fsm.destination;
+              if (!dest) {
+                fsm.transitionTo('idle');
+              } else {
+                fsm.path = this.collisionSystem.findPath(npcPos.x, npcPos.z, dest.x, dest.z);
+                fsm.pathIdx = 0;
+                if (fsm.path.length === 0) {
+                  fsm.transitionTo('idle');
+                  this.pickNextTaskForNpc(managed);
+                }
+              }
+            }
+          } else if (fsm.task === 'desk_work' && managed.isDeskSeated) {
+            managed.char.setHoldingCoffee(false);
+            fsm.walkPhase = 'stepping_in';
+          } else {
+            // Arrived at destination (Sala de Reuniões, Área de Café, Infra, etc.)
+            const dest = fsm.destination;
+            managed.char.setHoldingCoffee(Boolean(dest?.holdCoffee));
+            if (fsm.task === 'meeting' || fsm.task === 'colleague_visit') {
+              fsm.transitionTo(dest?.anim === 'talking' ? 'talking' : 'idle');
+            } else if (fsm.task === 'coffee') {
+              fsm.transitionTo(Math.random() < 0.55 ? 'talking' : 'idle');
+            } else {
+              fsm.transitionTo('idle');
+            }
+          }
+        } else if (fsm.walkPhase === 'stepping_in') {
+          const distHome = Math.hypot(managed.homeX - npcPos.x, managed.homeZ - npcPos.z);
+          if (this.moveNpcAlongPoint(managed, managed.homeX, managed.homeZ, dt, distHome < 1.25)) {
+            fsm.transitionTo('idle');
+          } else if (managed.stuckTime > 0.7) {
+            managed.stuckTime = 0;
+            fsm.transitionTo('idle');
+          }
+        }
+      } else if (fsm.state === 'talking') {
+        fsm.stateTimer -= dt;
+        fsm.talkToggleTimer -= dt;
+
+        const targetYaw = this.yawTowardSomeone(
+          managed,
+          playerPos,
+          fsm.destination?.yaw ?? managed.homeYaw
+        );
+
+        managed.char.setAnimation('talking', 0.24);
+        managed.char.rig.root.rotation.y = THREE.MathUtils.damp(
+          managed.char.rig.root.rotation.y,
+          targetYaw,
+          5.5,
+          dt
+        );
+
+        if (!isPlayerClose && fsm.talkToggleTimer <= 0) {
+          // Naturally alternate between speaking ('talking') and listening/sipping ('idle')
+          fsm.transitionTo('idle');
+        }
+
+        if (fsm.stateTimer <= 0 && !isPlayerClose) {
+          this.pickNextTaskForNpc(managed);
+        }
+      } else {
+        // fsm.state === 'idle'
+        fsm.stateTimer -= dt;
+        fsm.talkToggleTimer -= dt;
+
+        if (isPlayerClose && !isHomeSeat) {
+          fsm.transitionTo('talking');
+        } else if (isHomeSeat) {
+          const cycle = Math.sin(elapsed * 0.35 + idx * 1.7);
+          managed.char.setAnimation(cycle > -0.35 ? 'typing' : 'sit', 0.35);
+          managed.char.rig.root.rotation.y = THREE.MathUtils.damp(
+            managed.char.rig.root.rotation.y,
+            managed.homeYaw,
+            6,
+            dt
+          );
+        } else {
+          const dest = fsm.destination;
+          let idleClip: 'idle' | 'coffee' | 'interacting' = 'idle';
+          if (fsm.task === 'coffee' && dest?.holdCoffee) {
+            idleClip = 'coffee';
+          } else if (fsm.task === 'infra_check' && dest?.anim === 'interacting') {
+            idleClip = 'interacting';
+          }
+          managed.char.setAnimation(idleClip, 0.28);
+
+          const targetYaw = this.yawTowardSomeone(managed, playerPos, dest?.yaw ?? managed.homeYaw);
+          managed.char.rig.root.rotation.y = THREE.MathUtils.damp(
+            managed.char.rig.root.rotation.y,
+            targetYaw,
+            4.5,
+            dt
+          );
+
+          if (
+            !isPlayerClose &&
+            fsm.talkToggleTimer <= 0 &&
+            (fsm.task === 'meeting' || fsm.task === 'coffee' || fsm.task === 'colleague_visit')
+          ) {
+            fsm.transitionTo('talking');
+          }
+        }
+
+        if (fsm.stateTimer <= 0 && !isPlayerClose) {
+          this.pickNextTaskForNpc(managed);
+        }
+      }
+
+      // Keep interactive target synced with live position
+      managed.interactiveTarget.x = npcPos.x;
+      managed.interactiveTarget.z = isHomeSeat ? npcPos.z + 0.4 : npcPos.z;
+
+      managed.char.update(dt);
+      managed.bubble.position.y = (isHomeSeat ? 1.72 : 2.02) + Math.sin(elapsed * 2.8 + idx) * 0.04;
+      idx++;
+    });
+  }
+
+  public syncCutouts(camera: THREE.Camera, dt: number, playerPos: THREE.Vector3) {
+    this.npcs.forEach((managed) => {
+      const cutout = managed.cutout;
+      if (!cutout) return;
+      const state = managed.fsm.state;
+      const id = managed.data.id;
+      const pos = managed.char.rig.root.position;
+      const nearPlayer = Math.hypot(pos.x - playerPos.x, pos.z - playerPos.z) < 2.3;
+      let mode: CutoutMode = 'idle';
+      if (nearPlayer || state === 'talking') mode = 'talk';
+      else if (state === 'walking') mode = 'walk';
+      else if (id === 'npc_wbiondi' || id === 'npc_gustavo' || id === 'npc_vanesa') mode = 'loaf';
+
+      const yaw = managed.char.rig.root.rotation.y;
+      cutout.group.position.copy(pos);
+      cutout.present(dt, mode, camera, pos.x + Math.sin(yaw), pos.z + Math.cos(yaw), managed.fleeing);
+    });
+  }
+
+  /** Sand is fast on ABAP and even faster leaving the room when Biondi shows up. */
+  private steerSandAwayFromBiondi(dt: number, playerPos: THREE.Vector3) {
+    const sand = this.npcs.get('npc_sand');
+    const biondi = this.npcs.get('npc_wbiondi');
+    if (!sand || !biondi) return;
+
+    sand.fleeRetarget -= dt;
+    const sp = sand.char.rig.root.position;
+    const bp = biondi.char.rig.root.position;
+    const dx = sp.x - bp.x;
+    const dz = sp.z - bp.z;
+    const dist = Math.hypot(dx, dz) || 0.001;
+    const nearPlayer = Math.hypot(sp.x - playerPos.x, sp.z - playerPos.z) < 2.15;
+
+    if (dist > 8.2 || nearPlayer) {
+      if (sand.fleeing) {
+        sand.fleeing = false;
+        sand.walkSpeed = sand.calmSpeed;
+      }
+      return;
+    }
+
+    sand.fleeing = true;
+    sand.walkSpeed = 3.4;
+    const dest = sand.fsm.destination;
+    const destClear = dest ? Math.hypot(dest.x - bp.x, dest.z - bp.z) > 8 : false;
+    if (sand.fleeRetarget > 0 && sand.fsm.state === 'walking' && destClear) return;
+
+    sand.fleeRetarget = 1.4;
+    const ax = THREE.MathUtils.clamp(sp.x + (dx / dist) * 11, -18, 18);
+    const az = THREE.MathUtils.clamp(sp.z + (dz / dist) * 11, -14, 15);
+    this.assignTaskToNpc(
+      sand,
+      'colleague_visit',
+      {
+        x: ax,
+        z: az,
+        yaw: Math.atan2(dx, dz),
+        anim: 'idle',
+        holdCoffee: false,
+      },
+      5
+    );
+  }
+
+  public projectNameTags(camera: THREE.PerspectiveCamera, width: number, height: number) {
+    this.npcs.forEach((managed) => {
+      const pos = managed.char.rig.root.position;
+      const isSeated = managed.fsm.isAtHomeSeat(managed.isDeskSeated);
+      const yOffset = managed.cutout ? 1.96 : isSeated ? 1.72 : 1.96;
+
+      _projVec.set(pos.x, pos.y + yOffset, pos.z);
+      const dist = camera.position.distanceTo(_projVec);
+      _projVec.project(camera);
+
+      const isBehindCamera = _projVec.z < -1 || _projVec.z > 1;
+      if (isBehindCamera || dist > 25) {
+        managed.nameTagEl.style.opacity = '0';
+        return;
+      }
+
+      const sx = (_projVec.x * 0.5 + 0.5) * width;
+      const sy = (-_projVec.y * 0.5 + 0.5) * height;
+      if (sx < -120 || sx > width + 120 || sy < -60 || sy > height + 60) {
+        managed.nameTagEl.style.opacity = '0';
+        return;
+      }
+
+      const fade = THREE.MathUtils.clamp((25 - dist) / 6, 0, 1);
+      managed.nameTagEl.style.opacity = fade.toFixed(2);
+      managed.nameTagEl.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
+    });
+  }
+
+  public dispose() {
+    this.npcs.forEach((managed) => {
+      this.scene.remove(managed.char.rig.root);
+      managed.cutout?.dispose();
+      managed.nameTagEl.remove();
+      (managed.bubble.material as THREE.SpriteMaterial).map?.dispose();
+      (managed.bubble.material as THREE.SpriteMaterial).dispose();
+    });
+    this.npcs.clear();
+  }
+}
+
+// Pre-allocated math helpers (zero GC in animation loop)
+const _camForward = new THREE.Vector3();
+const _camRight = new THREE.Vector3();
+const _moveVec = new THREE.Vector3();
+const _rayOrigin = new THREE.Vector3();
+const _rayDir = new THREE.Vector3();
+const _desiredCamPos = new THREE.Vector3();
+const _projVec = new THREE.Vector3();
+
 export class OfficeScene {
   private container: HTMLElement;
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
-  private camera: THREE.OrthographicCamera;
+  private camera: THREE.PerspectiveCamera;
   private isSoftwareGl: boolean = false;
   private frameId: number = 0;
+  private destroyed: boolean = false;
   private clock: THREE.Clock;
+
+  // Materials & Office World
+  private mats: OfficeMaterialLibrary;
+  private officeResult: OfficeBuildResult;
+  private envTexture: THREE.Texture | null = null;
 
   // Physics & Collision
   public collisionSystem: CollisionSystem;
-  private playerRadius: number = 0.38;
+  private playerRadius: number = 0.4;
 
-  // Sabastian Player (The Sims Style)
-  private playerGroup: THREE.Group;
+  // Player (Marcelo — sprite cutout; the rig only drives the anim clock)
+  private playerChar: CharacterInstance;
+  private marceloSprite: MarceloSprite;
   private plumbob: THREE.Mesh;
-  private nametagSprite: THREE.Sprite;
-  private playerLegLeft: THREE.Mesh;
-  private playerLegRight: THREE.Mesh;
-  private playerArmLeft: THREE.Mesh;
-  private playerArmRight: THREE.Mesh;
-  private playerPos: THREE.Vector3 = new THREE.Vector3(0, 0, 1.2);
-  private playerSpeed: number = 8.5;
-  private isMoving: boolean = false;
-  private walkTime: number = 0;
+  private nameTagLayer: HTMLDivElement;
+  private playerNameTagEl: HTMLDivElement;
+  private playerPos: THREE.Vector3 = new THREE.Vector3(0, 0, 4.2);
+  private playerYaw: number = Math.PI;
+  private walkSpeed: number = 4.6;
+  private runSpeed: number = 8.4;
+  private interactTimer: number = 0;
+  private currentRoomName: string = 'Sala Principal de Sustentação';
 
-  // Navigation & Pathfinding
+  // Navigation & A* Pathfinding
   private activePath: { x: number; z: number }[] = [];
   private currentPathTargetIdx: number = 0;
   private pathLine: THREE.Line | null = null;
 
-  // Controls
+  // Controls & Camera Orbit
   private keysHeld: { [key: string]: boolean } = {};
+  private camTarget: THREE.Vector3 = new THREE.Vector3(0, 1.35, 4.2);
+  private camYaw: number = 0.45;
+  private targetCamYaw: number = 0.45;
+  private camPitch: number = 0.68;
+  private targetCamPitch: number = 0.68;
+  private camDistance: number = 10.5;
+  private targetCamDistance: number = 10.5;
+  private camRaycaster: THREE.Raycaster = new THREE.Raycaster();
+
+  private activePointers: Map<number, { x: number; y: number }> = new Map();
+  private primaryPointerId: number | null = null;
+  private pointerMovedDist: number = 0;
+  private lastPointerX: number = 0;
+  private lastPointerY: number = 0;
+  private lastPinchDist: number | null = null;
+
+  // Touch / Android / iPad Virtual Controls State
   private joystickVector: { x: number; y: number } = { x: 0, y: 0 };
+  private touchSprint: boolean = false;
 
-  // Camera follow (True 2.5D Isometric)
-  private camTarget: THREE.Vector3 = new THREE.Vector3(0, 0, 0);
-  private readonly isoOffset: THREE.Vector3 = new THREE.Vector3(26, 26, 26);
-
-  // Entities & Props
-  private npcs: Map<string, { group: THREE.Group; data: NPCData; bubble: THREE.Sprite }> = new Map();
+  // Entities & Interactive Targets
+  private npcManager: NPCCharacterManager;
   private interactiveTargets: InteractiveTarget[] = [];
   private currentNearTarget: InteractiveTarget | null = null;
   private proximityRing: THREE.Mesh;
@@ -73,14 +989,26 @@ export class OfficeScene {
 
   // Callbacks
   public onProximityChange: ((target: InteractiveTarget | null) => void) | null = null;
+  public onRoomChange: ((roomName: string) => void) | null = null;
   public onStepSound: (() => void) | null = null;
   private stepAccumulator: number = 0;
+
+  // Bound event listeners for clean disposal
+  private handleKeyDown: (e: KeyboardEvent) => void;
+  private handleKeyUp: (e: KeyboardEvent) => void;
+  private handleBlur: () => void;
+  private handlePointerDown: (e: PointerEvent) => void;
+  private handlePointerMove: (e: PointerEvent) => void;
+  private handlePointerUp: (e: PointerEvent) => void;
+  private handlePointerCancel: (e: PointerEvent) => void;
+  private handleWheel: (e: WheelEvent) => void;
+  private handleContextMenu: (e: MouseEvent) => void;
 
   constructor(container: HTMLElement) {
     this.container = container;
     this.collisionSystem = new CollisionSystem();
 
-    // Software WebGL probe
+    // Software WebGL guard
     try {
       const probeCanvas = document.createElement('canvas');
       const gl = probeCanvas.getContext('webgl2') || probeCanvas.getContext('webgl');
@@ -95,19 +1023,16 @@ export class OfficeScene {
       this.isSoftwareGl = false;
     }
 
-    // Scene
+    // Scene & Horizon Fog
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x0c1322);
-    this.scene.fog = new THREE.Fog(0x121820, 55, 110);
+    this.scene.background = new THREE.Color(0x0d1526);
+    this.scene.fog = new THREE.Fog(0x0d1526, 48, 92);
 
-    // Camera (True 2.5D Isometric Orthographic)
+    // Responsive 3rd-Person Perspective Camera
     const aspect = container.clientWidth / (container.clientHeight || 1);
-    const d = 16;
-    this.camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 0.1, 500);
-    this.camera.position.copy(this.isoOffset);
-    this.camera.lookAt(0, 0, 0);
+    this.camera = new THREE.PerspectiveCamera(46, aspect, 0.25, 160);
 
-    // Renderer
+    // Modern PBR WebGL Renderer
     this.renderer = new THREE.WebGLRenderer({
       antialias: !this.isSoftwareGl,
       powerPreference: 'high-performance',
@@ -116,885 +1041,349 @@ export class OfficeScene {
     this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.15;
+    this.renderer.toneMappingExposure = 1.12;
     this.renderer.shadowMap.enabled = !this.isSoftwareGl;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-
     this.container.appendChild(this.renderer.domElement);
+
+    // Studio Environment Reflections (PMREM RoomEnvironment)
+    const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
+    this.envTexture = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    this.scene.environment = this.envTexture;
+    pmremGenerator.dispose();
+
     this.clock = new THREE.Clock();
 
-    // Lighting
+    // Lighting Rig
     this.setupLighting();
 
-    // Build World with Realistic Textures and Collision Boundaries
-    this.buildTheSimsOfficeWorld();
+    // Shared PBR Materials & Complete 7-Zone Corporate Office
+    const glassDecal = createGlassDecalTexture();
+    this.mats = createOfficeMaterialLibrary(this.isSoftwareGl, glassDecal);
+    this.officeResult = buildCorporateOffice(this.scene, this.collisionSystem, this.mats, this.isSoftwareGl);
+    this.serverLeds = this.officeResult.serverLeds;
 
-    // Build Marcelo (Key User / SAP - Protagonista C2C)
-    const marcelo = this.buildMarcelo();
-    this.playerGroup = marcelo.group;
-    this.plumbob = marcelo.plumbob;
-    this.nametagSprite = marcelo.nametag;
-    this.playerLegLeft = marcelo.legLeft;
-    this.playerLegRight = marcelo.legRight;
-    this.playerArmLeft = marcelo.armLeft;
-    this.playerArmRight = marcelo.armRight;
-    this.scene.add(this.playerGroup);
+    // Build Articulated Human Marcelo (Protagonist)
+    this.playerChar = buildHumanCharacter(getMarceloAppearance(), !this.isSoftwareGl);
+    this.playerChar.rig.root.position.copy(this.playerPos);
+    this.playerChar.rig.root.rotation.y = this.playerYaw;
 
-    // Proximity indicator
-    const ringGeo = new THREE.RingGeometry(0.75, 0.9, 32);
+    this.plumbob = createSimsPlumbob();
+    this.plumbob.position.set(0, 1.98, 0);
+    this.playerChar.rig.root.add(this.plumbob);
+
+    this.scene.add(this.playerChar.rig.root);
+
+    this.marceloSprite = new MarceloSprite(() => this.hideProceduralMarcelo());
+    this.marceloSprite.group.position.copy(this.playerPos);
+    this.scene.add(this.marceloSprite.group);
+    this.marceloSprite.load(this.renderer.capabilities.getMaxAnisotropy());
+    this.hideProceduralMarcelo();
+
+    // Billboarded DOM .name-tag layer (World-to-Screen projection with backdrop-filter)
+    if (getComputedStyle(this.container).position === 'static') {
+      this.container.style.position = 'relative';
+    }
+    this.nameTagLayer = document.createElement('div');
+    this.nameTagLayer.className = 'name-tag-layer';
+    this.container.appendChild(this.nameTagLayer);
+
+    this.playerNameTagEl = document.createElement('div');
+    this.playerNameTagEl.className = 'name-tag name-tag--player';
+    const playerNameSpan = document.createElement('span');
+    playerNameSpan.textContent = 'MARCELO';
+    const playerRoleSpan = document.createElement('span');
+    playerRoleSpan.className = 'name-tag__role';
+    playerRoleSpan.textContent = 'Key User · C2C';
+    this.playerNameTagEl.appendChild(playerNameSpan);
+    this.playerNameTagEl.appendChild(playerRoleSpan);
+    this.nameTagLayer.appendChild(this.playerNameTagEl);
+
+    this.npcManager = new NPCCharacterManager(this.scene, this.collisionSystem, this.nameTagLayer);
+
+    // Proximity Indicator Ring
+    const ringGeo = new THREE.RingGeometry(0.68, 0.84, 36);
     ringGeo.rotateX(-Math.PI / 2);
     const ringMat = new THREE.MeshBasicMaterial({
       color: 0x38bdf8,
       transparent: true,
       opacity: 0.85,
       side: THREE.DoubleSide,
+      depthWrite: false,
     });
     this.proximityRing = new THREE.Mesh(ringGeo, ringMat);
-    this.proximityRing.position.set(0, 0.03, 0);
+    this.proximityRing.position.set(0, 0.04, 0);
     this.proximityRing.visible = false;
     this.scene.add(this.proximityRing);
 
-    // Inputs & Resize
-    this.setupInputs();
+    // Setup Interactive Spots across all 7 environments
+    this.setupInteractiveSpots();
+
+    // Bind Input Handlers
+    this.handleKeyDown = (e) => {
+      this.keysHeld[e.code] = true;
+    };
+    this.handleKeyUp = (e) => {
+      this.keysHeld[e.code] = false;
+    };
+    this.handleBlur = () => {
+      this.keysHeld = {};
+      this.activePointers.clear();
+      this.primaryPointerId = null;
+      this.lastPinchDist = null;
+      this.joystickVector.x = 0;
+      this.joystickVector.y = 0;
+    };
+    this.handleContextMenu = (e) => e.preventDefault();
+
+    this.handlePointerDown = (e) => {
+      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this.activePointers.size === 1) {
+        this.primaryPointerId = e.pointerId;
+        this.pointerMovedDist = 0;
+        this.lastPointerX = e.clientX;
+        this.lastPointerY = e.clientY;
+        this.lastPinchDist = null;
+      } else if (this.activePointers.size === 2) {
+        const pts = Array.from(this.activePointers.values());
+        this.lastPinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        this.pointerMovedDist = 999; // cancel click-to-walk on multi-touch pinch
+      }
+    };
+
+    this.handlePointerMove = (e) => {
+      if (!this.activePointers.has(e.pointerId)) return;
+      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (this.activePointers.size === 2) {
+        const pts = Array.from(this.activePointers.values());
+        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        if (this.lastPinchDist !== null) {
+          const delta = this.lastPinchDist - dist;
+          this.targetCamDistance = THREE.MathUtils.clamp(
+            this.targetCamDistance + delta * 0.025,
+            4.8,
+            17.5
+          );
+        }
+        this.lastPinchDist = dist;
+        return;
+      }
+
+      if (this.activePointers.size === 1 && e.pointerId === this.primaryPointerId) {
+        const dx = e.clientX - this.lastPointerX;
+        const dy = e.clientY - this.lastPointerY;
+        this.lastPointerX = e.clientX;
+        this.lastPointerY = e.clientY;
+        this.pointerMovedDist += Math.hypot(dx, dy);
+
+        // Smooth 3rd-person orbit camera rotation (mouse drag & single-finger touch)
+        const sensitivity = e.pointerType === 'touch' ? 0.0078 : 0.0065;
+        this.targetCamYaw -= dx * sensitivity;
+        this.targetCamPitch = THREE.MathUtils.clamp(this.targetCamPitch + dy * 0.005, 0.24, 1.15);
+      }
+    };
+
+    const endPointer = (e: PointerEvent, allowTapWalk: boolean) => {
+      if (!this.activePointers.has(e.pointerId)) return;
+      this.activePointers.delete(e.pointerId);
+
+      if (this.activePointers.size < 2) {
+        this.lastPinchDist = null;
+      }
+      if (this.activePointers.size === 1) {
+        const [remId, remPt] = Array.from(this.activePointers.entries())[0];
+        this.primaryPointerId = remId;
+        this.lastPointerX = remPt.x;
+        this.lastPointerY = remPt.y;
+        return;
+      }
+
+      const wasPrimary = e.pointerId === this.primaryPointerId;
+      if (this.activePointers.size === 0) {
+        this.primaryPointerId = null;
+      }
+
+      // Clean click or single-finger tap navigates via A* pathfinding
+      const isLeftOrTouch = e.pointerType !== 'mouse' || e.button === 0;
+      if (allowTapWalk && wasPrimary && this.pointerMovedDist < 9 && isLeftOrTouch) {
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const raycaster = new THREE.Raycaster();
+        raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera);
+        const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        const hit = new THREE.Vector3();
+
+        if (raycaster.ray.intersectPlane(groundPlane, hit)) {
+          const path = this.collisionSystem.findPath(this.playerPos.x, this.playerPos.z, hit.x, hit.z);
+          if (path && path.length > 0) {
+            this.activePath = path;
+            this.currentPathTargetIdx = 0;
+            this.drawPathLine(path);
+          }
+        }
+      }
+    };
+
+    this.handlePointerUp = (e) => endPointer(e, true);
+    this.handlePointerCancel = (e) => endPointer(e, false);
+
+    this.handleWheel = (e) => {
+      e.preventDefault();
+      this.targetCamDistance = THREE.MathUtils.clamp(
+        this.targetCamDistance + e.deltaY * 0.008,
+        4.8,
+        17.5
+      );
+    };
+
+    window.addEventListener('keydown', this.handleKeyDown);
+    window.addEventListener('keyup', this.handleKeyUp);
+    window.addEventListener('blur', this.handleBlur);
     window.addEventListener('resize', this.onResize);
 
-    // Render loop
+    const dom = this.renderer.domElement;
+    dom.style.touchAction = 'none';
+    dom.addEventListener('pointerdown', this.handlePointerDown);
+    window.addEventListener('pointermove', this.handlePointerMove);
+    window.addEventListener('pointerup', this.handlePointerUp);
+    window.addEventListener('pointercancel', this.handlePointerCancel);
+    dom.addEventListener('wheel', this.handleWheel, { passive: false });
+    dom.addEventListener('contextmenu', this.handleContextMenu);
+
+    // Pre-warm shaders on GPU
+    if (!this.isSoftwareGl) {
+      this.renderer.compile(this.scene, this.camera);
+    }
+
+    this.updateCamera(0.016);
     this.tick();
   }
 
   private setupLighting() {
-    // Ambient light
-    const ambientLight = new THREE.AmbientLight(0xf4f7fb, 1.05);
-    this.scene.add(ambientLight);
-
-    // Hemisphere light
-    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x1e293b, 0.55);
+    // Cool Sky / Warm Ground Architectural Hemisphere Fill
+    const hemiLight = new THREE.HemisphereLight(0xeef6ff, 0x262e3d, 0.78);
     this.scene.add(hemiLight);
 
-    // Warm Sun Directional Light with Soft Shadows
-    const dirLight = new THREE.DirectionalLight(0xfffaed, 1.35);
-    dirLight.position.set(28, 42, 24);
+    // Main Warm Sun Key Light (Sole shadow caster for crisp performance)
+    const dirLight = new THREE.DirectionalLight(0xfff4e0, 1.55);
+    dirLight.position.set(-22, 34, 18);
     if (!this.isSoftwareGl) {
       dirLight.castShadow = true;
       dirLight.shadow.mapSize.width = 2048;
       dirLight.shadow.mapSize.height = 2048;
-      dirLight.shadow.camera.near = 0.5;
-      dirLight.shadow.camera.far = 120;
-      const d = 28;
+      dirLight.shadow.camera.near = 2;
+      dirLight.shadow.camera.far = 95;
+      const d = 27;
       dirLight.shadow.camera.left = -d;
       dirLight.shadow.camera.right = d;
       dirLight.shadow.camera.top = d;
       dirLight.shadow.camera.bottom = -d;
-      dirLight.shadow.bias = -0.0005;
+      dirLight.shadow.bias = -0.0004;
       dirLight.shadow.normalBias = 0.02;
     }
     this.scene.add(dirLight);
 
-    // Cool fill light for architectural depth
-    const coolFill = new THREE.DirectionalLight(0x60a5fa, 0.45);
-    coolFill.position.set(-24, 25, -20);
-    this.scene.add(coolFill);
-
-    // Warm Downlights in Executive Office & Meeting Room
-    const spotMeeting = new THREE.SpotLight(0xfef08a, 1.2, 16, Math.PI / 4, 0.4);
-    spotMeeting.position.set(-13, 7, 7);
-    this.scene.add(spotMeeting);
-
-    const spotManager = new THREE.SpotLight(0xfef08a, 1.0, 16, Math.PI / 4, 0.4);
-    spotManager.position.set(-13, 7, -10);
-    this.scene.add(spotManager);
-  }
-
-  private buildTheSimsOfficeWorld() {
-    // Procedural Textures
-    const carpetTex = createCarpetTexture();
-    const woodTex = createWoodParquetTexture();
-    const tileTex = createCeramicTileTexture();
-    const glassDecal = createGlassDecalTexture();
-
-    // Floor Materials
-    const carpetMat = new THREE.MeshStandardMaterial({
-      map: carpetTex,
-      roughness: 0.85,
-      metalness: 0.05,
-    });
-    const woodMat = new THREE.MeshStandardMaterial({
-      map: woodTex,
-      roughness: 0.45,
-      metalness: 0.1,
-    });
-    const tileMat = new THREE.MeshStandardMaterial({
-      map: tileTex,
-      roughness: 0.35,
-      metalness: 0.15,
-    });
-
-    // 1. Base Flooring
-    // Main Open-Space Carpet
-    const groundGeo = new THREE.BoxGeometry(60, 0.2, 50);
-    const ground = new THREE.Mesh(groundGeo, carpetMat);
-    ground.position.set(0, -0.1, 0);
-    ground.receiveShadow = !this.isSoftwareGl;
-    this.scene.add(ground);
-
-    // Cafeteria / Lounge Wood Parquet Floor
-    const cafeFloorGeo = new THREE.BoxGeometry(20, 0.22, 16);
-    const cafeFloor = new THREE.Mesh(cafeFloorGeo, woodMat);
-    cafeFloor.position.set(11, -0.09, 8);
-    cafeFloor.receiveShadow = !this.isSoftwareGl;
-    this.scene.add(cafeFloor);
-
-    // Server Room High-Tech Floor
-    const serverFloorGeo = new THREE.BoxGeometry(10, 0.22, 12);
-    const serverFloor = new THREE.Mesh(serverFloorGeo, tileMat);
-    serverFloor.position.set(12, -0.09, -7);
-    serverFloor.receiveShadow = !this.isSoftwareGl;
-    this.scene.add(serverFloor);
-
-    // Executive Office Floor
-    const execFloorGeo = new THREE.BoxGeometry(12, 0.22, 14);
-    const execFloor = new THREE.Mesh(execFloorGeo, woodMat);
-    execFloor.position.set(-13, -0.09, -8);
-    execFloor.receiveShadow = !this.isSoftwareGl;
-    this.scene.add(execFloor);
-
-    // 2. Solid & Glass Architectural Walls with Collision
-    const solidWallMat = new THREE.MeshStandardMaterial({
-      color: 0x3e4856,
-      roughness: 0.7,
-      metalness: 0.1,
-    });
-    const glassWallMat = new THREE.MeshPhysicalMaterial({
-      color: 0x93c5fd,
-      transparent: true,
-      opacity: 0.45,
-      roughness: 0.15,
-      metalness: 0.1,
-      map: glassDecal,
-    });
-
-    // Outer Perimeter Walls
-    this.createSolidWall(0, -17.5, 50, 0.5, 3.0, solidWallMat, 'Parede Traseira');
-    this.createSolidWall(0, 17.5, 50, 0.5, 1.2, solidWallMat, 'Parede Frontal Baixa');
-    this.createSolidWall(-21.5, 0, 0.5, 35, 3.0, solidWallMat, 'Parede Esquerda');
-    this.createSolidWall(21.5, 0, 0.5, 35, 3.0, solidWallMat, 'Parede Direita');
-
-    // Internal Partitions with Doorways for Navigation
-    // Partition: Manager Office & Meeting Room (left)
-    // Left segment with door opening at x = -6, z from -1 to 1
-    this.createSolidWall(-13, -1, 12, 0.4, 2.4, glassWallMat, 'Divisória Sala Chefe');
-    this.createSolidWall(-6, -11, 0.4, 11, 2.4, glassWallMat, 'Divisória Lateral Reunião');
-    // Doorway between meeting room and open-space left clear at z = -4 to -2!
-
-    // Partition: Server Room & Consultoria (right)
-    this.createSolidWall(6, -8, 0.4, 14, 2.5, solidWallMat, 'Parede Servidores');
-    this.createSolidWall(14, -1, 14, 0.4, 2.4, glassWallMat, 'Divisória Consultoria');
-    // Doorway into server room at x = 6, z = 0 to 1
-
-    // Partition: Cafeteria & Lounge (bottom right)
-    this.createSolidWall(3, 11, 0.4, 13, 1.4, glassWallMat, 'Divisória Copa');
-    // Walkway opening at x = 3, z = 3 to 5
-
-    // 3. Reception Counter with Curvilinear Mesh & Illuminated SAP Sign
-    this.buildReceptionWithCollision();
-
-    // 4. Detailed Corporate Workstations
-    this.buildDetailedDesks();
-
-    // 5. Server Room with Perforated Cabinets & Blinking Lights
-    this.buildServerRoomWithCollision();
-
-    // 6. Cafeteria with Coffee Bar, Espresso Machine & Pool Table
-    this.buildCafeteriaWithCollision();
-
-    // 7. Executive Office & Boardroom
-    this.buildMeetingAndManagerWithCollision();
-
-    // 8. Register Interactive Targets
-    this.setupInteractiveSpots();
-  }
-
-  private createSolidWall(
-    x: number,
-    z: number,
-    w: number,
-    d: number,
-    h: number,
-    mat: THREE.Material,
-    name?: string
-  ) {
-    const geo = new THREE.BoxGeometry(w, h, d);
-    const wall = new THREE.Mesh(geo, mat);
-    wall.position.set(x, h / 2, z);
-    wall.castShadow = !this.isSoftwareGl;
-    wall.receiveShadow = !this.isSoftwareGl;
-    this.scene.add(wall);
-
-    // Register collision box in physics system
-    this.collisionSystem.addBox(x - w / 2, x + w / 2, z - d / 2, z + d / 2, name);
-  }
-
-  private buildReceptionWithCollision() {
-    // Curved Reception Desk (The Sims signature entrance)
-    const deskGroup = new THREE.Group();
-    const deskGeo = new THREE.CylinderGeometry(2.5, 2.5, 1.15, 32, 1, false, 0, Math.PI);
-    const deskMat = new THREE.MeshStandardMaterial({
-      color: 0x0284c7,
-      roughness: 0.3,
-      metalness: 0.25,
-    });
-    const desk = new THREE.Mesh(deskGeo, deskMat);
-    desk.rotation.y = -Math.PI / 2;
-    desk.position.set(0, 0.58, -9);
-    desk.castShadow = !this.isSoftwareGl;
-    deskGroup.add(desk);
-
-    // Reception inner desk surface
-    const innerSurface = new THREE.Mesh(
-      new THREE.BoxGeometry(2.8, 0.08, 1.2),
-      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 })
-    );
-    innerSurface.position.set(0, 0.85, -9.5);
-    deskGroup.add(innerSurface);
-
-    this.scene.add(deskGroup);
-
-    // Register Reception Desk Collision
-    this.collisionSystem.addBox(-2.5, 2.5, -10.5, -8.0, 'Balcão de Recepção');
-
-    // Illuminated SAP Billboard
-    const canvas = document.createElement('canvas');
-    canvas.width = 512;
-    canvas.height = 256;
-    const ctx = canvas.getContext('2d')!;
-    ctx.fillStyle = '#f8fafc';
-    ctx.fillRect(0, 0, 512, 256);
-    ctx.fillStyle = '#0070c0';
-    ctx.beginPath();
-    ctx.roundRect(36, 48, 150, 150, 18);
-    ctx.fill();
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 72px "Chakra Petch", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('SAP', 111, 145);
-    ctx.fillStyle = '#334155';
-    ctx.font = 'bold 28px sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText('CENTRO DE', 210, 112);
-    ctx.fillText('SOPORTE', 210, 150);
-
-    const logoTexture = new THREE.CanvasTexture(canvas);
-    logoTexture.colorSpace = THREE.SRGBColorSpace;
-    const logoMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(4.2, 2.1),
-      new THREE.MeshBasicMaterial({ map: logoTexture })
-    );
-    logoMesh.position.set(0, 2.8, -17.2);
-    this.scene.add(logoMesh);
-
-    // Glass Turnstiles with collision
-    [-2.6, 2.6].forEach((tx) => {
-      const turnstile = new THREE.Mesh(
-        new THREE.BoxGeometry(0.35, 1.0, 1.0),
-        new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.85, roughness: 0.2 })
-      );
-      turnstile.position.set(tx, 0.5, -5);
-      turnstile.castShadow = !this.isSoftwareGl;
-      this.scene.add(turnstile);
-
-      this.collisionSystem.addBox(tx - 0.25, tx + 0.25, -5.6, -4.4, 'Catraca');
-    });
-  }
-
-  private buildDetailedDesks() {
-    // Marcelo's Key User Desk (Center)
-    this.createTheSimsDesk(0, 2, 'Mesa do Marcelo (Key User · C2C)', '#0284c7', true, 'sap');
-
-    // Analyst Desks with Collision
-    this.createTheSimsDesk(-8, 2, 'Mesa Bruna (Folha)', '#8b5cf6', false, 'sap');
-    this.createTheSimsDesk(-3, 2, 'Mesa Carlos (Benefícios)', '#06b6d4', false, 'chart');
-    this.createTheSimsDesk(-8, -3, 'Mesa Juliana (Cadastro)', '#10b981', false, 'sap');
-    this.createTheSimsDesk(-3, -3, 'Mesa Roberto (Contábil)', '#f59e0b', false, 'chart');
-
-    // Consultant Desks (Right side)
-    this.createTheSimsDesk(10, -4, 'Mesa Mariana (Funcional HCM)', '#ec4899', false, 'sap');
-    this.createTheSimsDesk(14, -4, 'Mesa Lucas (ABAP)', '#3b82f6', false, 'code');
-  }
-
-  private createTheSimsDesk(
-    x: number,
-    z: number,
-    name: string,
-    chairColor: string,
-    isKeyUser: boolean,
-    screenType: 'sap' | 'code' | 'chart'
-  ) {
-    const group = new THREE.Group();
-
-    // Tabletop with beveled finish
-    const topGeo = new THREE.BoxGeometry(2.5, 0.1, 1.3);
-    const topMat = new THREE.MeshStandardMaterial({
-      color: 0xe7d3b0,
-      roughness: 0.35,
-      metalness: 0.1,
-    });
-    const top = new THREE.Mesh(topGeo, topMat);
-    top.position.set(0, 0.8, 0);
-    top.castShadow = !this.isSoftwareGl;
-    top.receiveShadow = !this.isSoftwareGl;
-    group.add(top);
-
-    // Sleek Metal Legs
-    const legGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.8, 12);
-    const legMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.85, roughness: 0.25 });
-    [[-1.15, -0.55], [1.15, -0.55], [-1.15, 0.55], [1.15, 0.55]].forEach(([lx, lz]) => {
-      const leg = new THREE.Mesh(legGeo, legMat);
-      leg.position.set(lx, 0.4, lz);
-      leg.castShadow = !this.isSoftwareGl;
-      group.add(leg);
-    });
-
-    // Dual Monitors on Key User Desk, single monitor on others
-    const monitorCount = isKeyUser ? 2 : 1;
-    const screenTex = createSapMonitorTexture(screenType);
-    const screenMat = new THREE.MeshBasicMaterial({ map: screenTex });
-
-    for (let i = 0; i < monitorCount; i++) {
-      const offsetX = monitorCount === 2 ? (i === 0 ? -0.45 : 0.45) : 0;
-
-      // Monitor Stand
-      const stand = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.3, 0.06), legMat);
-      stand.position.set(offsetX, 0.95, -0.38);
-      group.add(stand);
-
-      // Frame
-      const frame = new THREE.Mesh(
-        new THREE.BoxGeometry(0.74, 0.48, 0.04),
-        new THREE.MeshStandardMaterial({ color: 0x090d16, roughness: 0.4 })
-      );
-      frame.position.set(offsetX, 1.2, -0.38);
-      frame.castShadow = !this.isSoftwareGl;
-      group.add(frame);
-
-      // Screen Display
-      const display = new THREE.Mesh(new THREE.PlaneGeometry(0.68, 0.42), screenMat);
-      display.position.set(offsetX, 1.2, -0.35);
-      group.add(display);
-    }
-
-    // Keyboard & Mousepad
-    const pad = new THREE.Mesh(
-      new THREE.BoxGeometry(0.7, 0.015, 0.35),
-      new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.9 })
-    );
-    pad.position.set(0, 0.855, 0.1);
-    group.add(pad);
-
-    const kb = new THREE.Mesh(
-      new THREE.BoxGeometry(0.48, 0.02, 0.16),
-      new THREE.MeshStandardMaterial({ color: 0x475569 })
-    );
-    kb.position.set(-0.06, 0.865, 0.1);
-    group.add(kb);
-
-    // Ergonomic Chair (The Sims Style)
-    const chairGroup = new THREE.Group();
-    const seatMat = new THREE.MeshStandardMaterial({ color: chairColor, roughness: 0.55 });
-    const seat = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.1, 0.65), seatMat);
-    seat.position.set(0, 0.5, 0.65);
-    seat.castShadow = !this.isSoftwareGl;
-    chairGroup.add(seat);
-
-    const backrest = new THREE.Mesh(new THREE.BoxGeometry(0.65, 0.65, 0.1), seatMat);
-    backrest.position.set(0, 0.85, 0.92);
-    chairGroup.add(backrest);
-
-    const chairLeg = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.5, 8), legMat);
-    chairLeg.position.set(0, 0.25, 0.65);
-    chairGroup.add(chairLeg);
-
-    group.add(chairGroup);
-
-    group.position.set(x, 0, z);
-    this.scene.add(group);
-
-    // Register Desk and Chair Collision (prevents walking through)
-    this.collisionSystem.addBox(x - 1.35, x + 1.35, z - 0.75, z + 0.95, name);
-  }
-
-  private buildServerRoomWithCollision() {
-    const rackGeo = new THREE.BoxGeometry(1.3, 2.5, 0.9);
-    const rackTex = createServerRackTexture();
-    const rackMat = new THREE.MeshStandardMaterial({
-      map: rackTex,
-      roughness: 0.35,
-      metalness: 0.7,
-    });
-
-    [-2.2, 0, 2.2].forEach((offset, idx) => {
-      const rack = new THREE.Mesh(rackGeo, rackMat);
-      rack.position.set(12 + offset, 1.25, -9);
-      rack.castShadow = !this.isSoftwareGl;
-      this.scene.add(rack);
-
-      // Register rack collision
-      this.collisionSystem.addBox(12 + offset - 0.7, 12 + offset + 0.7, -9.5, -8.5, 'Rack de Servidor');
-
-      // Point Light with blinking LEDs
-      const ledLight = new THREE.PointLight(idx === 1 ? 0x06b6d4 : 0x22c55e, 1.5, 3.5);
-      ledLight.position.set(12 + offset, 1.6, -8.4);
-      this.scene.add(ledLight);
-      this.serverLeds.push(ledLight);
-    });
-
-    // Basis Desk
-    this.createTheSimsDesk(12, 4, 'Mesa Fábio (Basis / Infra)', '#6366f1', false, 'code');
-  }
-
-  private buildCafeteriaWithCollision() {
-    // Solid Coffee Counter
-    const counterGeo = new THREE.BoxGeometry(4.8, 1.15, 1.2);
-    const counterMat = new THREE.MeshStandardMaterial({ color: 0x451a03, roughness: 0.4 });
-    const counter = new THREE.Mesh(counterGeo, counterMat);
-    counter.position.set(10, 0.58, 14);
-    counter.castShadow = !this.isSoftwareGl;
-    this.scene.add(counter);
-    this.collisionSystem.addBox(7.5, 12.5, 13.3, 14.7, 'Balcão de Café');
-
-    // Espresso Machine (Stainless steel)
-    const machineGeo = new THREE.BoxGeometry(1.0, 0.75, 0.65);
-    const machineMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, metalness: 0.9, roughness: 0.15 });
-    const machine = new THREE.Mesh(machineGeo, machineMat);
-    machine.position.set(10, 1.5, 14);
-    this.scene.add(machine);
-
-    // Dining Tables with Collision
-    [[6, 6], [10, 6], [14, 6], [6, 10]].forEach(([rx, rz]) => {
-      const tableTop = new THREE.Mesh(
-        new THREE.CylinderGeometry(1.0, 1.0, 0.08, 24),
-        new THREE.MeshStandardMaterial({ color: 0xfde047, roughness: 0.5 })
-      );
-      tableTop.position.set(rx, 0.8, rz);
-      tableTop.castShadow = !this.isSoftwareGl;
-      this.scene.add(tableTop);
-
-      const pole = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.08, 0.08, 0.8, 8),
-        new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8 })
-      );
-      pole.position.set(rx, 0.4, rz);
-      this.scene.add(pole);
-
-      this.collisionSystem.addBox(rx - 1.0, rx + 1.0, rz - 1.0, rz + 1.0, 'Mesa de Refeição');
-    });
-
-    // Billiard / Pool Table with Collision
-    const poolGroup = new THREE.Group();
-    const poolBody = new THREE.Mesh(
-      new THREE.BoxGeometry(3.4, 0.4, 1.9),
-      new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.6 })
-    );
-    poolBody.position.set(0, 0.7, 0);
-    poolGroup.add(poolBody);
-
-    const felt = new THREE.Mesh(
-      new THREE.BoxGeometry(3.1, 0.05, 1.6),
-      new THREE.MeshStandardMaterial({ color: 0x15803d, roughness: 0.95 })
-    );
-    felt.position.set(0, 0.92, 0);
-    poolGroup.add(felt);
-
-    [[-1.5, -0.75], [1.5, -0.75], [-1.5, 0.75], [1.5, 0.75]].forEach(([px, pz]) => {
-      const leg = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.12, 0.12, 0.7, 8),
-        new THREE.MeshStandardMaterial({ color: 0x451a03 })
-      );
-      leg.position.set(px, 0.35, pz);
-      poolGroup.add(leg);
-    });
-    poolGroup.position.set(16, 0, 11);
-    this.scene.add(poolGroup);
-    this.collisionSystem.addBox(14.2, 17.8, 10.0, 12.0, 'Mesa de Sinuca');
-  }
-
-  private buildMeetingAndManagerWithCollision() {
-    // Conference Table & TV Screen
-    const tableGeo = new THREE.BoxGeometry(4.4, 0.1, 2.2);
-    const tableMat = new THREE.MeshStandardMaterial({ color: 0x9a3412, roughness: 0.35 });
-    const table = new THREE.Mesh(tableGeo, tableMat);
-    table.position.set(-13, 0.8, 7);
-    table.castShadow = !this.isSoftwareGl;
-    this.scene.add(table);
-    this.collisionSystem.addBox(-15.3, -10.7, 5.8, 8.2, 'Mesa de Reunião');
-
-    const tvScreen = new THREE.Mesh(
-      new THREE.BoxGeometry(3.2, 1.8, 0.1),
-      new THREE.MeshStandardMaterial({ color: 0x0284c7, roughness: 0.2 })
-    );
-    tvScreen.position.set(-13, 2.2, 11.8);
-    this.scene.add(tvScreen);
-
-    // Manager Desk in Private Office
-    this.createTheSimsDesk(-13, -10, 'Mesa Dr. Marcos (Gestor)', '#dc2626', false, 'chart');
-
-    // Decorative Planters with Collision
-    [[-18, 12], [2, 12], [18, -14], [-18, -14], [-6, 6]].forEach(([px, pz]) => {
-      const pot = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.4, 0.3, 0.65, 14),
-        new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 })
-      );
-      pot.position.set(px, 0.32, pz);
-      this.scene.add(pot);
-
-      const plantLeaves = new THREE.Mesh(
-        new THREE.SphereGeometry(0.6, 12, 12),
-        new THREE.MeshStandardMaterial({ color: 0x16a34a, roughness: 0.85 })
-      );
-      plantLeaves.position.set(px, 0.85, pz);
-      plantLeaves.scale.set(1, 1.4, 1);
-      plantLeaves.castShadow = !this.isSoftwareGl;
-      this.scene.add(plantLeaves);
-
-      this.collisionSystem.addBox(px - 0.45, px + 0.45, pz - 0.45, pz + 0.45, 'Vaso de Planta');
+    // Cool Rim / Fill Directional Light
+    const fillLight = new THREE.DirectionalLight(0x93c5fd, 0.55);
+    fillLight.position.set(24, 22, -20);
+    this.scene.add(fillLight);
+
+    // Warm Architectural Ceiling Downlights (no shadows for fast GPU performance)
+    const accentPoints: [number, number, number, number][] = [
+      [0, 3.4, -2, 0xfef3c7],     // Open space center
+      [-16, 3.4, -12, 0xfde68a],  // Sala do Gestor
+      [-16.8, 3.4, 0.5, 0xe0f2fe],// Sala de Reuniões
+      [12, 3.4, -1, 0xeef2ff],    // Consultoria SAP/ABAP
+      [14, 3.4, 12, 0xffedd5],    // Restaurante & Café
+    ];
+    accentPoints.forEach(([lx, ly, lz, color]) => {
+      const pt = new THREE.PointLight(color, 1.8, 18, 1.4);
+      pt.position.set(lx, ly, lz);
+      this.scene.add(pt);
     });
   }
 
   private setupInteractiveSpots() {
-    this.interactiveTargets.push({
-      id: 'desk_keyuser',
-      name: 'Mesa do Marcelo (C2C)',
-      type: 'desk',
-      x: 0,
-      z: 2.6,
-      radius: 1.8,
-      label: 'Terminal SAP / Chamados (Marcelo · C2C)',
-    });
-
-    this.interactiveTargets.push({
-      id: 'coffee_machine',
-      name: 'Cafeteira Expresso',
-      type: 'coffee',
-      x: 10,
-      z: 12.8,
-      radius: 1.8,
-      label: 'Tomar Café (+10 Energia)',
-    });
-
-    this.interactiveTargets.push({
-      id: 'restaurant_lunch',
-      name: 'Refeitório / Almoço',
-      type: 'restaurant',
-      x: 10,
-      z: 6,
-      radius: 2.2,
-      label: 'Almoçar (+30 Energia)',
-    });
-
-    this.interactiveTargets.push({
-      id: 'restroom_pause',
-      name: 'Banheiros / Pausa',
-      type: 'restroom',
-      x: 18,
-      z: -14,
-      radius: 2.0,
-      label: 'Pausa Rápida (-15 Estresse)',
-    });
-
-    this.interactiveTargets.push({
-      id: 'server_racks',
-      name: 'Racks de Servidores',
-      type: 'server',
-      x: 12,
-      z: -7.5,
-      radius: 2.2,
-      label: 'Status dos Servidores (SM37/ST22)',
-    });
-
-    this.interactiveTargets.push({
-      id: 'meeting_screen',
-      name: 'Sala de Reunião',
-      type: 'meeting',
-      x: -13,
-      z: 7,
-      radius: 2.4,
-      label: 'Painel de Inovação & Projetos',
-    });
-
-    this.interactiveTargets.push({
-      id: 'pool_table',
-      name: 'Mesa de Sinuca',
-      type: 'pool_table',
-      x: 16,
-      z: 11,
-      radius: 2.2,
-      label: 'Jogar Sinuca (-10 Estresse)',
-    });
-  }
-
-  /**
-   * Build Marcelo (Player) with C2C Lanyard Badge, The Sims Plumbob & Floating Nametag
-   */
-  private buildMarcelo(): {
-    group: THREE.Group;
-    plumbob: THREE.Mesh;
-    nametag: THREE.Sprite;
-    legLeft: THREE.Mesh;
-    legRight: THREE.Mesh;
-    armLeft: THREE.Mesh;
-    armRight: THREE.Mesh;
-  } {
-    const group = new THREE.Group();
-
-    // Contact shadow
-    const shadow = new THREE.Mesh(
-      new THREE.CircleGeometry(0.38, 20),
-      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.45 })
+    this.interactiveTargets.push(
+      {
+        id: 'desk_keyuser',
+        name: 'Mesa do Marcelo (C2C)',
+        type: 'desk',
+        x: 0,
+        z: 2.9,
+        radius: 2.0,
+        label: 'Terminal SAP / Chamados (Marcelo · C2C)',
+      },
+      {
+        id: 'coffee_machine',
+        name: 'Cafeteira Expresso',
+        type: 'coffee',
+        x: 18.0,
+        z: 14.6,
+        radius: 2.1,
+        label: 'Tomar Café (+10 Energia)',
+      },
+      {
+        id: 'restaurant_lunch',
+        name: 'Refeitório / Almoço',
+        type: 'restaurant',
+        x: 9.5,
+        z: 14.6,
+        radius: 2.3,
+        label: 'Almoçar (+30 Energia)',
+      },
+      {
+        id: 'restroom_pause',
+        name: 'Banheiros / Pausa',
+        type: 'restroom',
+        x: 21.0,
+        z: -14.5,
+        radius: 2.1,
+        label: 'Pausa Rápida (-15 Estresse)',
+      },
+      {
+        id: 'server_racks',
+        name: 'Racks de Servidores',
+        type: 'server',
+        x: 12.6,
+        z: -13.0,
+        radius: 2.4,
+        label: 'Status dos Servidores (SM37/ST22)',
+      },
+      {
+        id: 'meeting_screen',
+        name: 'Sala de Reunião',
+        type: 'meeting',
+        x: -16.8,
+        z: 0.5,
+        radius: 3.4,
+        label: 'Painel de Inovação & Projetos',
+      },
+      {
+        id: 'pool_table',
+        name: 'Mesa de Sinuca',
+        type: 'pool_table',
+        x: 18.5,
+        z: 10.2,
+        radius: 2.4,
+        label: 'Jogar Sinuca (-10 Estresse)',
+      }
     );
-    shadow.rotation.x = -Math.PI / 2;
-    shadow.position.y = 0.02;
-    group.add(shadow);
-
-    // Legs with Slacks & Polished Shoes
-    const legGeo = new THREE.CylinderGeometry(0.08, 0.09, 0.48, 10);
-    const slacksMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.7 });
-    const legLeft = new THREE.Mesh(legGeo, slacksMat);
-    legLeft.position.set(-0.12, 0.26, 0);
-    group.add(legLeft);
-
-    const legRight = new THREE.Mesh(legGeo, slacksMat);
-    legRight.position.set(0.12, 0.26, 0);
-    group.add(legRight);
-
-    // Shoes
-    const shoeMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.4 });
-    const shoeGeo = new THREE.BoxGeometry(0.14, 0.08, 0.22);
-    const shoeL = new THREE.Mesh(shoeGeo, shoeMat);
-    shoeL.position.set(-0.12, 0.04, 0.04);
-    group.add(shoeL);
-    const shoeR = new THREE.Mesh(shoeGeo, shoeMat);
-    shoeR.position.set(0.12, 0.04, 0.04);
-    group.add(shoeR);
-
-    // Torso (Corporate Royal Blue Button-down shirt with collar)
-    const shirtMat = new THREE.MeshStandardMaterial({ color: 0x5b6573, roughness: 0.55 });
-    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.62, 0.32), shirtMat);
-    torso.position.y = 0.78;
-    torso.castShadow = !this.isSoftwareGl;
-    group.add(torso);
-
-    // C2C Corporate Lanyard & Photo ID Badge
-    const c2cBadgeTex = createC2CBadgeTexture();
-    const c2cBadgeMat = new THREE.MeshStandardMaterial({
-      map: c2cBadgeTex,
-      roughness: 0.2,
-      metalness: 0.1,
-    });
-    const badge = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.2, 0.02), c2cBadgeMat);
-    badge.position.set(0.1, 0.74, 0.18);
-    group.add(badge);
-
-    // Orange C2C Lanyard ribbon
-    const lanyardMat = new THREE.MeshBasicMaterial({ color: 0xea580c });
-    const ribbonL = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.3, 6), lanyardMat);
-    ribbonL.position.set(0.06, 0.92, 0.15);
-    ribbonL.rotation.z = 0.3;
-    group.add(ribbonL);
-
-    const ribbonR = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.3, 6), lanyardMat);
-    ribbonR.position.set(0.14, 0.92, 0.15);
-    ribbonR.rotation.z = -0.3;
-    group.add(ribbonR);
-
-    // Arms & Watch (Marcelo's corporate watch)
-    const armGeo = new THREE.CylinderGeometry(0.065, 0.065, 0.48, 8);
-    const armLeft = new THREE.Mesh(armGeo, shirtMat);
-    armLeft.position.set(-0.34, 0.72, 0);
-    group.add(armLeft);
-
-    // Silver wristwatch on left arm
-    const watchMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.9, roughness: 0.2 });
-    const watch = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.075, 0.04, 12), watchMat);
-    watch.position.set(-0.34, 0.54, 0);
-    group.add(watch);
-
-    const armRight = new THREE.Mesh(armGeo, shirtMat);
-    armRight.position.set(0.34, 0.72, 0);
-    group.add(armRight);
-
-    // Head (Marcelo's charismatic face)
-    const skinMat = new THREE.MeshStandardMaterial({ color: 0xe0b48a, roughness: 0.45 });
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 16, 16), skinMat);
-    head.position.y = 1.34;
-    head.castShadow = !this.isSoftwareGl;
-    group.add(head);
-
-    // Modern styled haircut
-    const hairMat = new THREE.MeshStandardMaterial({ color: 0x291d17, roughness: 0.8 });
-    const hair = new THREE.Mesh(new THREE.SphereGeometry(0.28, 14, 14), hairMat);
-    hair.position.set(0, 1.4, -0.04);
-    hair.scale.set(1.02, 0.58, 1.05);
-    group.add(hair);
-
-    // Stylish Glasses (Intellectual Key User Look)
-    const glassesMat = new THREE.MeshBasicMaterial({ color: 0x0f172a });
-    const glassRimL = new THREE.Mesh(new THREE.TorusGeometry(0.06, 0.012, 8, 16), glassesMat);
-    glassRimL.position.set(-0.09, 1.35, 0.23);
-    group.add(glassRimL);
-
-    const glassRimR = new THREE.Mesh(new THREE.TorusGeometry(0.06, 0.012, 8, 16), glassesMat);
-    glassRimR.position.set(0.09, 1.35, 0.23);
-    group.add(glassRimR);
-
-    const glassBridge = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.012, 0.01), glassesMat);
-    glassBridge.position.set(0, 1.35, 0.24);
-    group.add(glassBridge);
-
-    // The Sims Plumbob (Rotating Green Diamond)
-    const plumbob = createSimsPlumbob();
-    plumbob.position.set(0, 2.3, 0);
-    group.add(plumbob);
-
-    const nametag = createMarceloBillboard('SABASTIAN');
-    nametag.position.set(0, 1.85, 0);
-    group.add(nametag);
-
-    plumbob.visible = false;
-
-    group.position.copy(this.playerPos);
-    this.camTarget.copy(this.playerPos);
-
-    return { group, plumbob, nametag, legLeft, legRight, armLeft, armRight };
-  }
-
-  private buildSabastian() {
-    return this.buildMarcelo();
   }
 
   public populateNPCs(npcList: NPCData[]) {
-    this.npcs.forEach((npcObj) => {
-      this.scene.remove(npcObj.group);
-    });
-    this.npcs.clear();
-    this.interactiveTargets = this.interactiveTargets.filter((t) => t.type !== 'npc');
-
-    npcList.forEach((npc) => {
-      const isFemale = ['npc_bruna_folha', 'npc_juliana_cadastro', 'npc_mariana_funcional', 'npc_tania_cafe'].includes(npc.id);
-      const group = createDetailedHumanAvatar(
-        npc.name.split(' ')[0],
-        npc.role,
-        isFemale,
-        npc.hairColor,
-        npc.color,
-        Boolean(npc.currentTicketId)
-      );
-
-      const bubble = (group.userData.bubble as THREE.Sprite) || this.createNPCSpeechBubble(Boolean(npc.currentTicketId));
-
-      group.position.set(npc.deskX, 0, npc.deskZ + 0.8);
-      group.rotation.y = npc.deskZ < 0 ? 0 : Math.PI;
-      this.scene.add(group);
-
-      this.npcs.set(npc.id, { group, data: npc, bubble });
-
-      this.interactiveTargets.push({
-        id: npc.id,
-        name: npc.name,
-        type: 'npc',
-        x: npc.deskX,
-        z: npc.deskZ + 0.8,
-        radius: 1.8,
-        label: `Falar com ${npc.name} (${npc.role})`,
-        npcData: npc,
-      });
-    });
+    this.interactiveTargets = this.npcManager.syncNPCs(
+      npcList,
+      this.interactiveTargets,
+      this.isSoftwareGl
+    );
   }
 
-  private createNPCSpeechBubble(hasTicket: boolean): THREE.Sprite {
-    const canvas = document.createElement('canvas');
-    canvas.width = 128;
-    canvas.height = 128;
-    const ctx = canvas.getContext('2d')!;
-
-    if (hasTicket) {
-      ctx.fillStyle = '#f5c518';
-      ctx.beginPath();
-      ctx.moveTo(64, 14);
-      ctx.lineTo(108, 58);
-      ctx.lineTo(64, 102);
-      ctx.lineTo(20, 58);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = '#1e293b';
-      ctx.font = 'bold 48px "Chakra Petch", sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('!', 64, 62);
-    } else {
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.roundRect(14, 28, 100, 52, 18);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.moveTo(46, 78);
-      ctx.lineTo(58, 104);
-      ctx.lineTo(72, 78);
-      ctx.fill();
-      ctx.fillStyle = '#38bdf8';
-      ctx.beginPath();
-      ctx.arc(46, 54, 8, 0, Math.PI * 2);
-      ctx.arc(70, 54, 8, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false });
-    const sprite = new THREE.Sprite(spriteMat);
-    sprite.scale.set(0.75, 0.75, 1);
-    return sprite;
-  }
-
-  private setupInputs() {
-    window.addEventListener('keydown', (e) => {
-      if (!this.active) return;
-      this.keysHeld[e.code] = true;
-    });
-
-    window.addEventListener('keyup', (e) => {
-      this.keysHeld[e.code] = false;
-    });
-
-    window.addEventListener('blur', () => {
-      this.keysHeld = {};
-    });
-
-    // Click/Touch with A* Pathfinding (Smart Navigation around walls)
-    this.renderer.domElement.addEventListener('pointerdown', (e) => {
-      const rect = this.renderer.domElement.getBoundingClientRect();
-      const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(new THREE.Vector2(x, y), this.camera);
-      const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-      const intersectPoint = new THREE.Vector3();
-
-      if (raycaster.ray.intersectPlane(groundPlane, intersectPoint)) {
-        // Calculate path using A* that navigates around walls and furniture!
-        const path = this.collisionSystem.findPath(
-          this.playerPos.x,
-          this.playerPos.z,
-          intersectPoint.x,
-          intersectPoint.z
-        );
-
-        if (path && path.length > 0) {
-          this.activePath = path;
-          this.currentPathTargetIdx = 0;
-          this.drawPathLine(path);
-        }
-      }
-    });
+  public setGameTime(timeMinutes: number) {
+    this.npcManager.setGameTime(timeMinutes);
   }
 
   private drawPathLine(path: { x: number; z: number }[]) {
@@ -1011,7 +1400,6 @@ export class OfficeScene {
       color: 0x38bdf8,
       dashSize: 0.4,
       gapSize: 0.2,
-      linewidth: 2,
     });
     this.pathLine = new THREE.Line(geo, mat);
     this.pathLine.computeLineDistances();
@@ -1022,27 +1410,31 @@ export class OfficeScene {
     if (!this.plumbob) return;
     const mat = this.plumbob.material as THREE.MeshStandardMaterial;
     if (stress > 70 || energy < 25) {
-      // Red Plumbob
       mat.color.setHex(0xef4444);
       mat.emissive.setHex(0xb91c1c);
     } else if (energy < 55) {
-      // Yellow Plumbob
       mat.color.setHex(0xf59e0b);
       mat.emissive.setHex(0xb45309);
     } else {
-      // Vibrant Green Sims Plumbob
       mat.color.setHex(0x22c55e);
       mat.emissive.setHex(0x15803d);
     }
   }
 
+  public playInteractionAnimation() {
+    this.interactTimer = 0.85;
+    this.playerChar.setAnimation('interacting', 0.14);
+  }
+
   public teleportPlayer(x: number, z: number) {
     this.playerPos.set(x, 0, z);
-    this.playerGroup.position.copy(this.playerPos);
-    this.camTarget.copy(this.playerPos);
+    this.playerChar.rig.root.position.copy(this.playerPos);
+    this.camTarget.set(x, 1.35, z);
     this.activePath = [];
     if (this.pathLine) {
       this.scene.remove(this.pathLine);
+      this.pathLine.geometry.dispose();
+      (this.pathLine.material as THREE.Material).dispose();
       this.pathLine = null;
     }
   }
@@ -1051,116 +1443,214 @@ export class OfficeScene {
     return this.currentNearTarget;
   }
 
+  public setJoystickVector(x: number, y: number) {
+    this.joystickVector.x = THREE.MathUtils.clamp(x, -1, 1);
+    this.joystickVector.y = THREE.MathUtils.clamp(y, -1, 1);
+  }
+
+  public setTouchSprint(active: boolean) {
+    this.touchSprint = active;
+  }
+
+  public getPlayerMark() {
+    return { x: this.playerPos.x, z: this.playerPos.z };
+  }
+
+  public nudgeCameraYaw(deltaYaw: number) {
+    this.targetCamYaw += deltaYaw;
+  }
+
+  private detectCurrentRoom(x: number, z: number): string {
+    if (x < -10.5 && z < -5.5) return 'Sala do Gestor';
+    if (x < -10.5 && z >= -5.5 && z <= 6.5) return 'Sala de Reuniões';
+    if (x > 6.0 && z < -7.0) return 'Infraestrutura & Servidores';
+    if (x > 6.0 && z >= -7.0 && z <= 5.5) return 'Consultoria SAP / ABAP';
+    if (x >= 5.5 && x < 13.5 && z > 5.5) return 'Restaurante / Refeitório';
+    if (x >= 13.5 && z > 5.5) return 'Área de Café & Descompressão';
+    return 'Sala Principal de Sustentação';
+  }
+
   private updateMovement(dt: number) {
-    let dx = 0;
-    let dz = 0;
+    // Camera-relative horizontal forward & right vectors
+    _camForward.set(-Math.sin(this.camYaw), 0, -Math.cos(this.camYaw)).normalize();
+    _camRight.set(Math.cos(this.camYaw), 0, -Math.sin(this.camYaw)).normalize();
+    _moveVec.set(0, 0, 0);
 
-    // 1. Keyboard Controls (WASD / Setas) with Wall Sliding Collision
-    if (this.keysHeld['KeyW'] || this.keysHeld['ArrowUp']) {
-      dx -= 1;
-      dz -= 1;
-    }
-    if (this.keysHeld['KeyS'] || this.keysHeld['ArrowDown']) {
-      dx += 1;
-      dz += 1;
-    }
-    if (this.keysHeld['KeyA'] || this.keysHeld['ArrowLeft']) {
-      dx -= 1;
-      dz += 1;
-    }
-    if (this.keysHeld['KeyD'] || this.keysHeld['ArrowRight']) {
-      dx += 1;
-      dz += 1;
-    }
+    let inputFwd = 0;
+    let inputRight = 0;
+    if (this.keysHeld['KeyW'] || this.keysHeld['ArrowUp']) inputFwd += 1;
+    if (this.keysHeld['KeyS'] || this.keysHeld['ArrowDown']) inputFwd -= 1;
+    if (this.keysHeld['KeyA'] || this.keysHeld['ArrowLeft']) inputRight -= 1;
+    if (this.keysHeld['KeyD'] || this.keysHeld['ArrowRight']) inputRight += 1;
 
-    const hasKeyboardInput = Math.abs(dx) > 0.1 || Math.abs(dz) > 0.1;
-    if (hasKeyboardInput) {
-      // Clear pathfinding if manual keyboard is used
+    inputRight += this.joystickVector.x;
+    inputFwd += this.joystickVector.y;
+
+    const hasDirectionalInput = Math.abs(inputFwd) > 0.08 || Math.abs(inputRight) > 0.08;
+    if (hasDirectionalInput) {
+      _moveVec.addScaledVector(_camForward, inputFwd).addScaledVector(_camRight, inputRight);
       this.activePath = [];
       if (this.pathLine) {
         this.scene.remove(this.pathLine);
+        this.pathLine.geometry.dispose();
+        (this.pathLine.material as THREE.Material).dispose();
         this.pathLine = null;
       }
-    }
-
-    // 2. A* Pathfinding Following (When ground clicked)
-    if (!hasKeyboardInput && this.activePath.length > 0 && this.currentPathTargetIdx < this.activePath.length) {
-      const targetPoint = this.activePath[this.currentPathTargetIdx];
-      const diffX = targetPoint.x - this.playerPos.x;
-      const diffZ = targetPoint.z - this.playerPos.z;
-      const dist = Math.sqrt(diffX * diffX + diffZ * diffZ);
-
+    } else if (this.activePath.length > 0 && this.currentPathTargetIdx < this.activePath.length) {
+      const tp = this.activePath[this.currentPathTargetIdx];
+      const diffX = tp.x - this.playerPos.x;
+      const diffZ = tp.z - this.playerPos.z;
+      const dist = Math.hypot(diffX, diffZ);
       if (dist > 0.25) {
-        dx = diffX / dist;
-        dz = diffZ / dist;
+        _moveVec.set(diffX / dist, 0, diffZ / dist);
       } else {
         this.currentPathTargetIdx++;
         if (this.currentPathTargetIdx >= this.activePath.length) {
           this.activePath = [];
           if (this.pathLine) {
             this.scene.remove(this.pathLine);
+            this.pathLine.geometry.dispose();
+            (this.pathLine.material as THREE.Material).dispose();
             this.pathLine = null;
           }
         }
       }
     }
 
-    const length = Math.sqrt(dx * dx + dz * dz);
-    if (length > 0.05) {
-      this.isMoving = true;
-      dx /= length;
-      dz /= length;
+    const isRunning = Boolean(
+      this.keysHeld['ShiftLeft'] || this.keysHeld['ShiftRight'] || this.touchSprint
+    );
+    const speed = isRunning ? this.runSpeed : this.walkSpeed;
 
-      const nextX = this.playerPos.x + dx * this.playerSpeed * dt;
-      const nextZ = this.playerPos.z + dz * this.playerSpeed * dt;
+    if (this.interactTimer > 0) {
+      this.interactTimer -= dt;
+    }
 
-      // PHYSICS & COLLISION RESOLUTION: Sabastian NEVER walks through walls or furniture!
-      const resolved = this.collisionSystem.resolveMovement(
+    const len = _moveVec.length();
+    if (len > 0.05) {
+      _moveVec.divideScalar(len);
+      this.interactTimer = 0; // cancel interact anim if player starts moving
+
+      const resolved = this.collisionSystem.moveCircle(
         this.playerPos.x,
         this.playerPos.z,
-        nextX,
-        nextZ,
+        _moveVec.x * speed * dt,
+        _moveVec.z * speed * dt,
         this.playerRadius
       );
-
       this.playerPos.x = resolved.x;
       this.playerPos.z = resolved.z;
 
-      // Turn Sabastian towards movement direction
-      this.playerGroup.rotation.y = Math.atan2(dx, dz);
+      // Smooth shortest-angle character yaw interpolation
+      const targetYaw = Math.atan2(_moveVec.x, _moveVec.z);
+      let deltaYaw = targetYaw - this.playerYaw;
+      while (deltaYaw > Math.PI) deltaYaw -= Math.PI * 2;
+      while (deltaYaw < -Math.PI) deltaYaw += Math.PI * 2;
 
-      // Walk cycle animation (Legs and arms swing)
-      this.walkTime += dt * 14;
-      const swing = Math.sin(this.walkTime);
-      this.playerLegLeft.rotation.x = swing * 0.6;
-      this.playerLegRight.rotation.x = -swing * 0.6;
-      this.playerArmLeft.rotation.x = -swing * 0.5;
-      this.playerArmRight.rotation.x = swing * 0.5;
+      this.playerYaw += deltaYaw * Math.min(1, dt * 12);
+      this.playerChar.rig.root.rotation.y = this.playerYaw;
 
-      // Footstep sound trigger
-      this.stepAccumulator += dt;
-      if (this.stepAccumulator > 0.32) {
+      if (Math.abs(deltaYaw) > 1.35 && !isRunning) {
+        this.playerChar.setAnimation('turning', 0.14);
+      } else {
+        this.playerChar.setAnimation(isRunning ? 'run' : 'walk', 0.18);
+      }
+
+      this.stepAccumulator += dt * (isRunning ? 1.55 : 1.0);
+      if (this.stepAccumulator > 0.42) {
         this.stepAccumulator = 0;
         if (this.onStepSound) this.onStepSound();
       }
+    } else if (this.interactTimer > 0) {
+      this.playerChar.setAnimation('interacting', 0.15);
     } else {
-      this.isMoving = false;
-      this.playerLegLeft.rotation.x = 0;
-      this.playerLegRight.rotation.x = 0;
-      this.playerArmLeft.rotation.x = 0;
-      this.playerArmRight.rotation.x = 0;
+      this.playerChar.setAnimation('idle', 0.24);
     }
 
-    this.playerGroup.position.copy(this.playerPos);
+    if (len <= 0.05) {
+      const near = this.npcManager.nearestPerson(this.playerPos.x, this.playerPos.z, 3.6);
+      if (near) {
+        const faceYaw = Math.atan2(near.x - this.playerPos.x, near.z - this.playerPos.z);
+        let turn = faceYaw - this.playerYaw;
+        while (turn > Math.PI) turn -= Math.PI * 2;
+        while (turn < -Math.PI) turn += Math.PI * 2;
+        this.playerYaw += turn * Math.min(1, dt * 6);
+        this.playerChar.rig.root.rotation.y = this.playerYaw;
+      }
+    }
 
-    // Smooth Camera Follow
-    this.camTarget.lerp(this.playerPos, Math.min(dt * 5.0, 1.0));
-    this.camera.position.set(
-      this.camTarget.x + this.isoOffset.x,
-      this.camTarget.y + this.isoOffset.y,
-      this.camTarget.z + this.isoOffset.z
+    this.playerChar.rig.root.position.copy(this.playerPos);
+    this.playerChar.update(dt);
+
+    // Room transition check
+    const room = this.detectCurrentRoom(this.playerPos.x, this.playerPos.z);
+    if (room !== this.currentRoomName) {
+      this.currentRoomName = room;
+      if (this.onRoomChange) this.onRoomChange(room);
+    }
+  }
+
+  private updateCamera(dt: number) {
+    // Exponential damping for responsive, silky 3rd-person orbit & follow
+    this.camYaw = THREE.MathUtils.damp(this.camYaw, this.targetCamYaw, 10, dt);
+    this.camPitch = THREE.MathUtils.damp(this.camPitch, this.targetCamPitch, 10, dt);
+    this.camDistance = THREE.MathUtils.damp(this.camDistance, this.targetCamDistance, 10, dt);
+
+    const targetX = this.playerPos.x;
+    const targetY = 1.35;
+    const targetZ = this.playerPos.z;
+    this.camTarget.x = THREE.MathUtils.damp(this.camTarget.x, targetX, 8, dt);
+    this.camTarget.y = THREE.MathUtils.damp(this.camTarget.y, targetY, 8, dt);
+    this.camTarget.z = THREE.MathUtils.damp(this.camTarget.z, targetZ, 8, dt);
+
+    const horizDist = Math.cos(this.camPitch) * this.camDistance;
+    const vertDist = Math.sin(this.camPitch) * this.camDistance;
+
+    _desiredCamPos.set(
+      this.camTarget.x + Math.sin(this.camYaw) * horizDist,
+      this.camTarget.y + vertDist,
+      this.camTarget.z + Math.cos(this.camYaw) * horizDist
     );
+
+    // Wall Collision Check: prevent camera from clipping through solid office walls
+    _rayOrigin.copy(this.camTarget);
+    _rayDir.copy(_desiredCamPos).sub(_rayOrigin);
+    const fullDist = _rayDir.length();
+    if (fullDist > 0.01) {
+      _rayDir.divideScalar(fullDist);
+      this.camRaycaster.set(_rayOrigin, _rayDir);
+      this.camRaycaster.near = 0.2;
+      this.camRaycaster.far = fullDist;
+      const hits = this.camRaycaster.intersectObjects(this.officeResult.cameraOccluders, false);
+      if (hits.length > 0 && hits[0].distance < fullDist) {
+        const safeDist = Math.max(1.8, hits[0].distance - 0.35);
+        _desiredCamPos.copy(_rayOrigin).addScaledVector(_rayDir, safeDist);
+      }
+    }
+
+    this.camera.position.copy(_desiredCamPos);
     this.camera.lookAt(this.camTarget);
+    this.syncMarceloSprite(dt);
+  }
+
+  private hideProceduralMarcelo() {
+    this.playerChar.rig.root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.isMesh && mesh !== this.plumbob) mesh.visible = false;
+    });
+  }
+
+  private syncMarceloSprite(dt: number) {
+    this.marceloSprite.group.position.copy(this.playerPos);
+    const state = this.playerChar.currentState;
+    let mode: MarceloMove = 'idle';
+    if (state === 'run') mode = 'run';
+    else if (state === 'walk' || state === 'turning') mode = 'walk';
+    else if (state === 'interacting' || state === 'talking' || state === 'coffee') mode = 'interact';
+
+    const lookX = this.playerPos.x + Math.sin(this.playerYaw);
+    const lookZ = this.playerPos.z + Math.cos(this.playerYaw);
+    this.marceloSprite.present(dt, mode, this.interactTimer, this.camera, lookX, lookZ);
   }
 
   private checkProximity() {
@@ -1170,7 +1660,7 @@ export class OfficeScene {
     for (const target of this.interactiveTargets) {
       const dx = target.x - this.playerPos.x;
       const dz = target.z - this.playerPos.z;
-      const dist = Math.sqrt(dx * dx + dz * dz);
+      const dist = Math.hypot(dx, dz);
 
       if (dist < target.radius && dist < minDist) {
         minDist = dist;
@@ -1181,7 +1671,7 @@ export class OfficeScene {
     if (nearest !== this.currentNearTarget) {
       this.currentNearTarget = nearest;
       if (nearest) {
-        this.proximityRing.position.set(nearest.x, 0.03, nearest.z);
+        this.proximityRing.position.set(nearest.x, 0.04, nearest.z);
         this.proximityRing.visible = true;
       } else {
         this.proximityRing.visible = false;
@@ -1191,68 +1681,143 @@ export class OfficeScene {
       }
     }
 
-    if (this.proximityRing.visible) {
-      const s = 1.0 + Math.sin(Date.now() * 0.006) * 0.08;
+    if (this.proximityRing.visible && nearest) {
+      this.proximityRing.position.set(nearest.x, 0.04, nearest.z);
+      const s = 1.0 + Math.sin(performance.now() * 0.006) * 0.08;
       this.proximityRing.scale.set(s, s, s);
     }
   }
 
-  private animateEnvironment(time: number) {
-    // Rotate and bob The Sims Plumbob above Sabastian's head
+  private updatePlayerNameTag(width: number, height: number) {
+    _projVec.set(this.playerPos.x, this.playerPos.y + 2.02, this.playerPos.z);
+    _projVec.project(this.camera);
+
+    if (_projVec.z < -1 || _projVec.z > 1) {
+      this.playerNameTagEl.style.opacity = '0';
+      return;
+    }
+
+    const sx = (_projVec.x * 0.5 + 0.5) * width;
+    const sy = (-_projVec.y * 0.5 + 0.5) * height;
+    if (sx < -120 || sx > width + 120 || sy < -60 || sy > height + 60) {
+      this.playerNameTagEl.style.opacity = '0';
+      return;
+    }
+
+    this.playerNameTagEl.style.opacity = '1';
+    this.playerNameTagEl.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
+  }
+
+  private animateEnvironmentAndNPCs(dt: number, time: number) {
+    // Rotate and bob Plumbob cleanly above Marcelo's .name-tag
     if (this.plumbob) {
-      this.plumbob.rotation.y = time * 2.5;
-      this.plumbob.position.y = 2.3 + Math.sin(time * 3) * 0.08;
+      this.plumbob.rotation.y = time * 2.4;
+      this.plumbob.position.y = 1.98 + Math.sin(time * 3) * 0.04;
     }
 
     // Blinking Server LEDs
     this.serverLeds.forEach((light, i) => {
-      const blink = Math.sin(time * 6 + i * 2.3) > 0.1;
-      light.intensity = blink ? 1.5 : 0.25;
+      const blink = Math.sin(time * 5.5 + i * 2.1) > 0.1;
+      light.intensity = blink ? 1.45 : 0.25;
     });
 
-    // NPC Floating Bubbles
-    this.npcs.forEach((npcObj) => {
-      npcObj.bubble.position.y = 2.8 + Math.sin(time * 3 + npcObj.data.deskX) * 0.06;
-    });
+    // Update NPCs via explicit FSM (idle / walking / talking) inside NPCCharacterManager
+    this.npcManager.update(dt, time, this.playerPos);
+    this.npcManager.syncCutouts(this.camera, dt, this.playerPos);
   }
 
-  public active = true;
+  private projectAllNameTags() {
+    const width = this.container.clientWidth || 1;
+    const height = this.container.clientHeight || 1;
+    this.updatePlayerNameTag(width, height);
+    this.npcManager.projectNameTags(this.camera, width, height);
+  }
+
+  private afterDraw(cb: () => void) {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    const sync = gl.fenceSync?.(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!sync) {
+      this.frameId = window.setTimeout(cb, 80);
+      return;
+    }
+    gl.flush();
+    const poll = () => {
+      if (this.destroyed) {
+        gl.deleteSync(sync);
+        return;
+      }
+      const state = gl.getSyncParameter(sync, gl.SYNC_STATUS);
+      if (state === gl.UNSIGNALED) {
+        this.frameId = window.setTimeout(poll, 5);
+      } else {
+        gl.deleteSync(sync);
+        this.frameId = window.setTimeout(cb, 80);
+      }
+    };
+    this.frameId = window.setTimeout(poll, 5);
+  }
 
   private tick = () => {
-    this.frameId = requestAnimationFrame(this.tick);
+    if (this.destroyed) return;
     const rawDt = this.clock.getDelta();
-    if (!this.active) return;
     const dt = Math.min(rawDt, 0.05);
+    const elapsed = this.clock.getElapsedTime();
 
     this.updateMovement(dt);
+    this.updateCamera(dt);
     this.checkProximity();
-    this.animateEnvironment(this.clock.getElapsedTime());
+    this.animateEnvironmentAndNPCs(dt, elapsed);
 
     this.renderer.render(this.scene, this.camera);
+    this.projectAllNameTags();
+
+    if (this.isSoftwareGl) {
+      this.afterDraw(this.tick);
+    } else {
+      this.frameId = requestAnimationFrame(this.tick);
+    }
   };
 
   private onResize = () => {
     if (!this.container) return;
     const width = this.container.clientWidth;
-    const height = this.container.clientHeight;
-    const aspect = width / (height || 1);
-    const d = 11.5;
-
-    this.camera.left = -d * aspect;
-    this.camera.right = d * aspect;
-    this.camera.top = d;
-    this.camera.bottom = -d;
+    const height = this.container.clientHeight || 1;
+    this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
-
     this.renderer.setSize(width, height);
   };
 
   public destroy() {
+    this.destroyed = true;
     cancelAnimationFrame(this.frameId);
+    clearTimeout(this.frameId);
+
+    window.removeEventListener('keydown', this.handleKeyDown);
+    window.removeEventListener('keyup', this.handleKeyUp);
+    window.removeEventListener('blur', this.handleBlur);
     window.removeEventListener('resize', this.onResize);
+    window.removeEventListener('pointermove', this.handlePointerMove);
+    window.removeEventListener('pointerup', this.handlePointerUp);
+    window.removeEventListener('pointercancel', this.handlePointerCancel);
+
+    const dom = this.renderer.domElement;
+    dom.removeEventListener('pointerdown', this.handlePointerDown);
+    dom.removeEventListener('wheel', this.handleWheel);
+    dom.removeEventListener('contextmenu', this.handleContextMenu);
+
+    this.npcManager.dispose();
+    this.marceloSprite.dispose();
+    this.nameTagLayer.remove();
+
+    this.officeResult.disposables.geometries.forEach((g) => g.dispose());
+    this.officeResult.disposables.materials.forEach((m) => m.dispose());
+    this.officeResult.disposables.textures.forEach((t) => t.dispose());
+    this.mats.dispose();
+    this.envTexture?.dispose();
     this.renderer.dispose();
-    if (this.renderer.domElement.parentElement) {
-      this.renderer.domElement.parentElement.removeChild(this.renderer.domElement);
+
+    if (dom.parentElement) {
+      dom.parentElement.removeChild(dom);
     }
   }
 }

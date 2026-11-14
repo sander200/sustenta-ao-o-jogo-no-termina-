@@ -4,9 +4,7 @@
  */
 
 import React, { useEffect, useRef, useState } from 'react';
-import type { InteractiveTarget } from './game/three/OfficeScene.ts';
-import { ExpedienteWorld } from './game/world3d/ExpedienteWorld.ts';
-import { EvaluatorPanel } from './game/world3d/EvaluatorPanel.tsx';
+import { OfficeScene, InteractiveTarget } from './game/three/OfficeScene.ts';
 import { sound } from './game/audio.ts';
 import {
   INITIAL_EMAILS,
@@ -26,18 +24,33 @@ import { EndOfDayModal } from './game/ui/EndOfDayModal.tsx';
 import { HelpModal } from './game/ui/HelpModal.tsx';
 import { AchievementsModal } from './game/ui/AchievementsModal.tsx';
 import { TitleScreen } from './game/ui/TitleScreen.tsx';
+import { TouchControls } from './game/ui/TouchControls.tsx';
+import { OfficeMap } from './game/ui/OfficeMap.tsx';
 import confetti from 'canvas-confetti';
+import './game.css';
 
 const SAVE_KEY = 'sustentacao_save_v1';
 
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement>(null);
-  const officeSceneRef = useRef<ExpedienteWorld | null>(null);
+  const officeSceneRef = useRef<OfficeScene | null>(null);
+  const camilinhaHourRef = useRef<number | null>(null);
 
   // Game flow state
   const [gameState, setGameState] = useState<'title' | 'playing'>('title');
   const [hasSavedGame, setHasSavedGame] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [showTouchControls, setShowTouchControls] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return (
+      'ontouchstart' in window ||
+      navigator.maxTouchPoints > 0 ||
+      Boolean(window.matchMedia?.('(pointer: coarse)')?.matches)
+    );
+  });
+  const [isTouchSprinting, setIsTouchSprinting] = useState(false);
+  const [dockOpen, setDockOpen] = useState(false);
+  const [showMap, setShowMap] = useState(false);
 
   // Player & Game entities state
   const [stats, setStats] = useState<PlayerStats>({
@@ -62,7 +75,7 @@ export default function App() {
 
   // Proximity & Interaction
   const [nearTarget, setNearTarget] = useState<InteractiveTarget | null>(null);
-  const [currentRoom, setCurrentRoom] = useState<string>('Sala Principal');
+  const [currentRoom, setCurrentRoom] = useState<string>('Mesa do Marcelo (C2C)');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Modals
@@ -72,7 +85,6 @@ export default function App() {
   const [showEmails, setShowEmails] = useState(false);
   const [showKanban, setShowKanban] = useState(false);
   const [showEndOfDay, setShowEndOfDay] = useState(false);
-  const [showEvaluator, setShowEvaluator] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showAchievements, setShowAchievements] = useState(false);
 
@@ -90,12 +102,27 @@ export default function App() {
   useEffect(() => {
     if (!canvasMountRef.current) return;
 
-    const scene = new ExpedienteWorld(canvasMountRef.current);
+    const scene = new OfficeScene(canvasMountRef.current);
     officeSceneRef.current = scene;
 
     scene.populateNPCs(npcs);
-    scene.onProximityChange = (target) => setNearTarget(target);
-    scene.onRoomChange = (room) => setCurrentRoom(room);
+
+    scene.onProximityChange = (target) => {
+      setNearTarget(target);
+      if (target) {
+        if (target.type === 'restroom') setCurrentRoom('Banheiros / Pausa');
+        else if (target.type === 'coffee' || target.type === 'restaurant' || target.type === 'pool_table')
+          setCurrentRoom('Café & Descompressão');
+        else if (target.type === 'server') setCurrentRoom('Infra / TI - Servidores');
+        else if (target.type === 'meeting') setCurrentRoom('Sala de Reunião');
+        else if (target.npcData?.room) setCurrentRoom(target.npcData.room);
+      }
+    };
+
+    scene.onRoomChange = (roomName) => {
+      setCurrentRoom(roomName);
+    };
+
     scene.onStepSound = () => {
       sound.playFootstep();
     };
@@ -120,32 +147,12 @@ export default function App() {
     }
   }, [stats.energy, stats.stress]);
 
+  // Synchronize game clock with NPC FSM schedule (Sala de Reunião <-> Área de Café)
   useEffect(() => {
-    const world = officeSceneRef.current;
-    if (!world) return;
-    world.suspended =
-      gameState !== 'playing' ||
-      Boolean(selectedTicket) ||
-      Boolean(activeDialogueNPC) ||
-      showTicketList ||
-      showEmails ||
-      showKanban ||
-      showEndOfDay ||
-      showHelp ||
-      showAchievements ||
-      showEvaluator;
-  }, [
-    gameState,
-    selectedTicket,
-    activeDialogueNPC,
-    showTicketList,
-    showEmails,
-    showKanban,
-    showEndOfDay,
-    showHelp,
-    showAchievements,
-    showEvaluator,
-  ]);
+    if (officeSceneRef.current) {
+      officeSceneRef.current.setGameTime(stats.timeMinutes);
+    }
+  }, [stats.timeMinutes]);
 
   // Persistent Auto-save
   useEffect(() => {
@@ -187,6 +194,50 @@ export default function App() {
 
     return () => clearInterval(interval);
   }, [gameState, showEndOfDay]);
+
+  // Camilinha cobra resultado toda hora cheia, das 09:00 às 17:00
+  useEffect(() => {
+    if (gameState !== 'playing') return;
+    const hour = Math.floor(stats.timeMinutes / 60);
+    if (camilinhaHourRef.current === null) {
+      camilinhaHourRef.current = hour;
+      return;
+    }
+    if (camilinhaHourRef.current === hour) return;
+    camilinhaHourRef.current = hour;
+    if (hour < 9 || hour > 17) return;
+
+    const hh = String(hour).padStart(2, '0');
+    const mailId = `mail_cami_d${stats.day}_h${hour}`;
+    const nags = [
+      'Marcelo, passou mais uma hora e eu não vi atualização. Quero número, prazo e dono dos chamados. Não me manda “estamos vendo”. Manda resultado.',
+      `Status das ${hh}:00. Quais chamados andaram e quais continuam parados? Eu cobro de hora em hora porque o expediente não espera.`,
+      'Se o resultado não chegou no meu e-mail, ele não existe. Atualiza a fila antes que eu passe na sua mesa.',
+      'Hora cheia. Me diz o que fechou, o que travou e quem está devendo resposta. Sem texto bonito.',
+    ];
+    setEmails((prev) => {
+      if (prev.some((m) => m.id === mailId)) return prev;
+      return [
+        {
+          id: mailId,
+          fromName: 'Camilinha',
+          fromRole: 'Cobra Resultado',
+          subject: `STATUS ${hh}:00 — cadê o resultado?`,
+          timestamp: `${hh}:00`,
+          body: nags[hour % nags.length],
+          read: false,
+          urgent: true,
+          actionType: 'info',
+        },
+        ...prev,
+      ];
+    });
+    sound.playNotification();
+    setToastMessage(`Camilinha cobrou o status das ${hh}:00`);
+    window.setTimeout(() => {
+      setToastMessage((cur) => (cur?.startsWith('Camilinha cobrou') ? null : cur));
+    }, 3200);
+  }, [gameState, stats.timeMinutes, stats.day]);
 
   // Toast helper
   const showToast = (msg: string) => {
@@ -301,8 +352,7 @@ export default function App() {
           showKanban ||
           showEndOfDay ||
           showHelp ||
-          showAchievements ||
-          showEvaluator;
+          showAchievements;
 
         if (!anyModalOpen && nearTarget) {
           e.preventDefault();
@@ -316,7 +366,6 @@ export default function App() {
         setShowKanban(false);
         setShowHelp(false);
         setShowAchievements(false);
-        setShowEvaluator(false);
       }
     };
 
@@ -332,13 +381,13 @@ export default function App() {
     showEndOfDay,
     showHelp,
     showAchievements,
-    showEvaluator,
     gameState,
   ]);
 
   // Perform interaction with target
   const handleExecuteInteraction = () => {
     if (!nearTarget) return;
+    officeSceneRef.current?.playInteractionAnimation();
 
     if (nearTarget.type === 'npc' && nearTarget.npcData) {
       sound.playOpenModal();
@@ -397,15 +446,13 @@ export default function App() {
     } else if (nearTarget.type === 'meeting') {
       sound.playOpenModal();
       setShowKanban(true);
-    } else if (nearTarget.type === 'academy') {
-      sound.playOpenModal();
-      setShowEvaluator(true);
     }
   };
 
   // Start New Game
   const handleStartNewGame = () => {
     localStorage.removeItem(SAVE_KEY);
+    camilinhaHourRef.current = null;
     setStats({
       energy: 85,
       stress: 25,
@@ -425,7 +472,7 @@ export default function App() {
     setAchievements(INITIAL_ACHIEVEMENTS);
     setGameState('playing');
     if (officeSceneRef.current) {
-      officeSceneRef.current.teleportPlayer(0, 1.2);
+      officeSceneRef.current.teleportPlayer(0, 4.2);
     }
   };
 
@@ -450,6 +497,7 @@ export default function App() {
   // Next Day Transition
   const handleStartNextDay = () => {
     setShowEndOfDay(false);
+    camilinhaHourRef.current = null;
     setStats((prev) => ({
       ...prev,
       day: prev.day + 1,
@@ -459,7 +507,7 @@ export default function App() {
       isDayFinished: false,
     }));
     if (officeSceneRef.current) {
-      officeSceneRef.current.teleportPlayer(0, 1.2);
+      officeSceneRef.current.teleportPlayer(0, 4.2);
     }
     showToast(`🌅 Início do Dia ${stats.day + 1}! Novo expediente com a equipe.`);
   };
@@ -493,11 +541,33 @@ export default function App() {
   };
 
   const unreadEmailCount = emails.filter((m) => !m.read).length;
+  const anyModalOpen =
+    Boolean(selectedTicket) ||
+    Boolean(activeDialogueNPC) ||
+    showTicketList ||
+    showEmails ||
+    showKanban ||
+    showEndOfDay ||
+    showHelp ||
+    showAchievements;
+
+  const handleJoystickMove = React.useCallback((x: number, y: number) => {
+    officeSceneRef.current?.setJoystickVector(x, y);
+  }, []);
+
+  const handleToggleTouchSprint = React.useCallback((active: boolean) => {
+    setIsTouchSprinting(active);
+    officeSceneRef.current?.setTouchSprint(active);
+  }, []);
+
+  const handleRotateCamera = React.useCallback((deltaYaw: number) => {
+    officeSceneRef.current?.nudgeCameraYaw(deltaYaw);
+  }, []);
 
   return (
-    <main className="relative w-screen h-screen overflow-hidden bg-slate-950 font-tech">
+    <main className="relative w-screen h-screen overflow-hidden bg-slate-950 font-tech select-none">
       {/* 3D WebGL Canvas Viewport */}
-      <div ref={canvasMountRef} className="absolute inset-0 w-full h-full cursor-grab active:cursor-grabbing" />
+      <div ref={canvasMountRef} className="absolute inset-0 w-full h-full cursor-grab active:cursor-grabbing touch-none" />
 
       {/* Title Screen Overlay */}
       {gameState === 'title' && (
@@ -520,6 +590,8 @@ export default function App() {
           nearTarget={nearTarget}
           currentRoom={currentRoom}
           isMuted={isMuted}
+          showTouchControls={showTouchControls}
+          onToggleTouchControls={() => setShowTouchControls((prev) => !prev)}
           onToggleMute={() => {
             const nextMuted = !isMuted;
             setIsMuted(nextMuted);
@@ -531,12 +603,31 @@ export default function App() {
           onOpenAchievements={() => setShowAchievements(true)}
           onOpenHelp={() => setShowHelp(true)}
           onInteract={handleExecuteInteraction}
+          onOpenMap={() => setShowMap(true)}
+          onDockChange={setDockOpen}
+        />
+      )}
+
+      {gameState === 'playing' && showMap && officeSceneRef.current && (
+        <OfficeMap scene={officeSceneRef.current} onClose={() => setShowMap(false)} />
+      )}
+
+      {/* Android & iPad On-Screen Touch Controls */}
+      {gameState === 'playing' && showTouchControls && !anyModalOpen && (
+        <TouchControls
+          nearTarget={nearTarget}
+          isSprinting={isTouchSprinting}
+          onJoystickMove={handleJoystickMove}
+          onToggleSprint={handleToggleTouchSprint}
+          onRotateCamera={handleRotateCamera}
+          onInteract={handleExecuteInteraction}
+          open={dockOpen}
         />
       )}
 
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="pointer-events-none absolute bottom-24 left-3 z-30 max-w-sm">
+        <div className="absolute top-18 left-1/2 -translate-x-1/2 z-50 pointer-events-none animate-in fade-in slide-in-from-top-4 duration-200">
           <div className="bg-slate-900/95 border-2 border-emerald-500/80 text-emerald-200 px-5 py-2.5 rounded-xl shadow-2xl font-tech text-sm font-bold flex items-center gap-2 backdrop-blur-md">
             <span>{toastMessage}</span>
           </div>
@@ -653,20 +744,6 @@ export default function App() {
       )}
 
       {/* MODAL 7: How to Play / Help Guide */}
-      {showEvaluator && (
-        <EvaluatorPanel
-          onClose={() => setShowEvaluator(false)}
-          onApproved={() => {
-            setStats((prev) => ({
-              ...prev,
-              sapKnowledge: Math.min(100, prev.sapKnowledge + 15),
-              reputation: Math.min(100, prev.reputation + 6),
-            }));
-            showToast('Missão 001 aprovada pela IA Avaliadora. +SAP XP e reputação.');
-          }}
-        />
-      )}
-
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
 
       {/* MODAL 8: Corporate Achievements (Conquistas C2C) */}

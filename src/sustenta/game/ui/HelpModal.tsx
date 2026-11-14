@@ -42,10 +42,12 @@ export const HelpModal: React.FC<HelpModalProps> = ({ onClose }) => {
               Controles de Movimentação & Interação
             </h3>
             <ul className="text-xs text-slate-300 space-y-1.5 font-mono-code">
-              <li>• <strong>W, A, S, D</strong> ou <strong>Setas</strong>: Caminhar pelo escritório 2.5D</li>
-              <li>• <strong>Clique do Mouse / Toque</strong>: Andar até o ponto indicado</li>
+              <li>• <strong>W, A, S, D</strong> ou <strong>Setas</strong>: Caminhar pelo escritório 3D</li>
+              <li>• <strong>Shift</strong>: Correr pelos corredores</li>
+              <li>• <strong>Arrastar Mouse / Scroll</strong>: Girar e aproximar a câmera em 3ª pessoa</li>
+              <li>• <strong>Clique no Piso</strong>: Caminhar automaticamente até o ponto indicado</li>
               <li>• <strong>Tecla E</strong> ou <strong>Barra de Espaço</strong>: Interagir com pessoas e objetos</li>
-              <li>• <strong>Botão Interagir</strong>: Aparece automaticamente quando próximo de uma mesa ou colega</li>
+              <li>• <strong>Android &amp; iPad</strong>: Joystick virtual na esquerda, botões Correr/Ação/Câmera na direita, arrastar com 1 dedo gira a câmera e pinça com 2 dedos dá zoom</li>
             </ul>
           </div>
 

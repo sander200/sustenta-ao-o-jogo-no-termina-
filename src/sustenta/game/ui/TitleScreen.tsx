@@ -1,6 +1,8 @@
 import React from 'react';
 import { sound } from '../audio.ts';
-import { Play, RotateCcw, HelpCircle, Briefcase, Zap, ShieldAlert, Sparkles } from 'lucide-react';
+import { publicUrl } from '@/lib/public-url';
+import { previewPathPrefix } from '@/lib/preview-path-prefix';
+import { Play, RotateCcw, HelpCircle, Briefcase, Zap, ShieldAlert, Sparkles, Download } from 'lucide-react';
 
 interface TitleScreenProps {
   hasSavedGame: boolean;
@@ -15,13 +17,18 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   onResumeGame,
   onOpenHelp,
 }) => {
+  const [apkHref, setApkHref] = React.useState(publicUrl('/Sustentacao-teste.apk'));
+  React.useEffect(() => {
+    const prefix = previewPathPrefix(window.location.hostname, window.location.pathname) ?? '';
+    setApkHref(`${prefix}/Sustentacao-teste.apk`);
+  }, []);
   return (
     <div className="absolute inset-0 z-40 flex flex-col justify-between p-6 sm:p-12 bg-gradient-to-b from-slate-950/90 via-slate-900/80 to-slate-950/95 backdrop-blur-sm select-none font-tech">
       {/* Top Bar with Enterprise Pill */}
       <div className="flex items-center justify-between">
         <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-900/40 border border-blue-500/30 text-blue-300 text-xs font-mono-code">
           <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-          <span>SAP ENTERPRISE SUPPORT SIMULATOR 3D</span>
+          <span>SAP ENTERPRISE SUPPORT SIMULATOR 2.5D</span>
         </div>
 
         <div className="text-xs text-slate-400 font-mono-code hidden sm:block">
@@ -102,6 +109,15 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
             <span>Novo Expediente</span>
           </button>
 
+          <a
+            href={apkHref}
+            download="Sustentacao-teste.apk"
+            className="w-full sm:w-auto px-6 py-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 active:scale-95 text-slate-950 font-bold text-sm transition-all flex items-center justify-center gap-2 cursor-pointer"
+          >
+            <Download className="w-4 h-4" />
+            <span>Baixar APK Android</span>
+          </a>
+
           {hasSavedGame && (
             <button
               onClick={() => {
@@ -130,11 +146,11 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
 
       {/* Flat Control-hint line at footer */}
       <div className="text-center text-xs text-slate-400 font-mono-code pt-4">
-        <span>WASD: Mover</span>
+        <span>WASD / Setas: Mover</span>
         <span className="mx-2">·</span>
-        <span>Arraste o mouse: Câmera</span>
+        <span>Espaço / E: Ação</span>
         <span className="mx-2">·</span>
-        <span>E: Interagir</span>
+        <span>Clique no chão: Andar</span>
       </div>
     </div>
   );
