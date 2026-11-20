@@ -95,7 +95,8 @@ export class MarceloSprite {
     this.billboard(camera);
     const away = view.dot < -0.42;
     const beside = view.dot < 0.5;
-    const nose: 1 | -1 = view.screen >= 0 ? 1 : -1;
+    // Walk and run art faces image-left. Negative scale points that nose to screen-right.
+    const nose: 1 | -1 = view.screen >= 0 ? -1 : 1;
 
     let next: FrameId = 'idle';
     if (mode === 'run' || mode === 'walk') {
